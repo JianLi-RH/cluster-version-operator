@@ -10,13 +10,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"k8s.io/klog/v2"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	configv1 "github.com/openshift/api/config/v1"
@@ -24,15 +24,11 @@ import (
 
 	"github.com/openshift/cluster-version-operator/lib/resourcemerge"
 	"github.com/openshift/cluster-version-operator/pkg/featuregates"
+	"github.com/openshift/cluster-version-operator/pkg/internal"
 	"github.com/openshift/cluster-version-operator/pkg/payload"
 )
 
 const (
-	// ClusterStatusFailing is set on the ClusterVersion status when a cluster
-	// cannot reach the desired state. It is considered more serious than Degraded
-	// and indicates the cluster is not healthy.
-	ClusterStatusFailing = configv1.ClusterStatusConditionType("Failing")
-
 	// ConditionalUpdateConditionTypeRecommended is a type of the condition present on a conditional update
 	// that indicates whether the conditional update is recommended or not
 	ConditionalUpdateConditionTypeRecommended = "Recommended"
@@ -159,21 +155,6 @@ func mergeOperatorHistory(cvStatus *configv1.ClusterVersionStatus, desired confi
 	cvStatus.Desired = desired
 }
 
-// ClusterVersionInvalid indicates that the cluster version has an error that prevents the server from
-// taking action. The cluster version operator will only reconcile the current state as long as this
-// condition is set.
-const ClusterVersionInvalid configv1.ClusterStatusConditionType = "Invalid"
-
-// DesiredReleaseAccepted indicates whether the requested (desired) release payload was successfully loaded
-// and no failures occurred during image verification and precondition checking.
-const DesiredReleaseAccepted configv1.ClusterStatusConditionType = "ReleaseAccepted"
-
-// ImplicitlyEnabledCapabilities is True if there are enabled capabilities which the user is not currently
-// requesting via spec.capabilities, because the cluster version operator does not support uninstalling
-// capabilities if any associated resources were previously managed by the CVO or disabling previously
-// enabled capabilities.
-const ImplicitlyEnabledCapabilities configv1.ClusterStatusConditionType = "ImplicitlyEnabledCapabilities"
-
 // syncStatus calculates the new status of the ClusterVersion based on the current sync state and any
 // validation errors found. We allow the caller to pass the original object to avoid DeepCopying twice.
 func (optr *Operator) syncStatus(ctx context.Context, original, config *configv1.ClusterVersion, status *SyncWorkerStatus, validationErrs field.ErrorList) error {
@@ -186,7 +167,7 @@ func (optr *Operator) syncStatus(ctx context.Context, original, config *configv1
 
 	cvUpdated := false
 	// update the config with the latest available updates
-	if updated := optr.getAvailableUpdates().NeedsUpdate(config); updated != nil {
+	if updated := optr.getAvailableUpdates().NeedsUpdate(config, optr.enabledFeatureGates.StatusReleaseArchitecture()); updated != nil {
 		cvUpdated = true
 		config = updated
 	}
@@ -202,7 +183,7 @@ func (optr *Operator) syncStatus(ctx context.Context, original, config *configv1
 	updateClusterVersionStatus(&config.Status, status, optr.release, optr.getAvailableUpdates, optr.enabledFeatureGates, validationErrs)
 
 	if klog.V(6).Enabled() {
-		klog.Infof("Apply config: %s", diff.ObjectReflectDiff(original, config))
+		klog.Infof("Apply config: %s", cmp.Diff(original, config))
 	}
 	updated, err := applyClusterVersionStatus(ctx, optr.client.ConfigV1(), config, original)
 	optr.rememberLastUpdate(updated)
@@ -229,11 +210,17 @@ func updateClusterVersionStatus(cvStatus *configv1.ClusterVersionStatus, status 
 		if len(status.Actual.URL) == 0 {
 			status.Actual.URL = release.URL
 		}
+		if len(status.Actual.Architecture) == 0 {
+			status.Actual.Architecture = release.Architecture
+		}
 		if status.Actual.Channels == nil {
 			status.Actual.Channels = append(release.Channels[:0:0], release.Channels...) // copy
 		}
 	}
 	desired := mergeReleaseMetadata(status.Actual, getAvailableUpdates)
+	if !enabledGates.StatusReleaseArchitecture() {
+		desired.Architecture = configv1.ClusterVersionArchitecture("")
+	}
 
 	risksMsg := ""
 	if desired.Image == status.loadPayloadStatus.Update.Image {
@@ -259,21 +246,21 @@ func updateClusterVersionStatus(cvStatus *configv1.ClusterVersionStatus, status 
 		reason = "InvalidClusterVersion"
 
 		resourcemerge.SetOperatorStatusCondition(&cvStatus.Conditions, configv1.ClusterOperatorStatusCondition{
-			Type:               ClusterVersionInvalid,
+			Type:               internal.ClusterVersionInvalid,
 			Status:             configv1.ConditionTrue,
 			Reason:             reason,
 			Message:            buf.String(),
 			LastTransitionTime: now,
 		})
 	} else {
-		resourcemerge.RemoveOperatorStatusCondition(&cvStatus.Conditions, ClusterVersionInvalid)
+		resourcemerge.RemoveOperatorStatusCondition(&cvStatus.Conditions, internal.ClusterVersionInvalid)
 	}
 
 	// set the implicitly enabled capabilities condition
 	setImplicitlyEnabledCapabilitiesCondition(cvStatus, status.CapabilitiesStatus.ImplicitlyEnabledCaps, now)
 
-	// set the desired release accepted condition
-	setDesiredReleaseAcceptedCondition(cvStatus, status.loadPayloadStatus, now)
+	// set the release accepted condition
+	setReleaseAcceptedCondition(cvStatus, status.loadPayloadStatus, now)
 
 	// set the available condition
 	if status.Completed > 0 {
@@ -312,7 +299,7 @@ func updateClusterVersionStatus(cvStatus *configv1.ClusterVersionStatus, status 
 
 	// set the failing condition
 	failingCondition := configv1.ClusterOperatorStatusCondition{
-		Type:               ClusterStatusFailing,
+		Type:               internal.ClusterStatusFailing,
 		Status:             configv1.ConditionFalse,
 		LastTransitionTime: now,
 	}
@@ -321,6 +308,14 @@ func updateClusterVersionStatus(cvStatus *configv1.ClusterVersionStatus, status 
 		failingCondition.Reason = failingReason
 		failingCondition.Message = failingMessage
 	}
+	if failure != nil &&
+		strings.HasPrefix(progressReason, slowCOUpdatePrefix) {
+		failingCondition.Status = configv1.ConditionUnknown
+		failingCondition.Reason = "SlowClusterOperator"
+		failingCondition.Message = progressMessage
+	}
+	progressReason = strings.TrimPrefix(progressReason, slowCOUpdatePrefix)
+
 	resourcemerge.SetOperatorStatusCondition(&cvStatus.Conditions, failingCondition)
 
 	// update progressing
@@ -397,28 +392,6 @@ func updateClusterVersionStatus(cvStatus *configv1.ClusterVersionStatus, status 
 		}
 	}
 
-	oldRiCondition := resourcemerge.FindOperatorStatusCondition(cvStatus.Conditions, reconciliationIssuesConditionType)
-	if enabledGates.ReconciliationIssuesCondition() || (oldRiCondition != nil && enabledGates.UnknownVersion()) {
-		riCondition := configv1.ClusterOperatorStatusCondition{
-			Type:    reconciliationIssuesConditionType,
-			Status:  configv1.ConditionFalse,
-			Reason:  noReconciliationIssuesReason,
-			Message: noReconciliationIssuesMessage,
-		}
-		if status.Failure != nil {
-			message, err := reconciliationIssueFromError(status.Failure)
-			if err != nil {
-				message = err.Error()
-			}
-			riCondition.Status = configv1.ConditionTrue
-			riCondition.Reason = reconciliationIssuesFoundReason
-			riCondition.Message = message
-		}
-		resourcemerge.SetOperatorStatusCondition(&cvStatus.Conditions, riCondition)
-	} else if oldRiCondition != nil {
-		resourcemerge.RemoveOperatorStatusCondition(&cvStatus.Conditions, reconciliationIssuesConditionType)
-	}
-
 	// default retrieved updates if it is not set
 	if resourcemerge.FindOperatorStatusCondition(cvStatus.Conditions, configv1.RetrievedUpdates) == nil {
 		resourcemerge.SetOperatorStatusCondition(&cvStatus.Conditions, configv1.ClusterOperatorStatusCondition{
@@ -474,6 +447,12 @@ func filterOutUpdateErrors(errs []error, updateEffect payload.UpdateEffectType) 
 func setImplicitlyEnabledCapabilitiesCondition(cvStatus *configv1.ClusterVersionStatus, implicitlyEnabled []configv1.ClusterVersionCapability,
 	now metav1.Time) {
 
+	// This is to clean up the condition with type=ImplicitlyEnabled introduced by OCPBUGS-56114
+	if c := resourcemerge.FindOperatorStatusCondition(cvStatus.Conditions, "ImplicitlyEnabled"); c != nil {
+		klog.V(2).Infof("Remove the condition with type ImplicitlyEnabled")
+		resourcemerge.RemoveOperatorStatusCondition(&cvStatus.Conditions, "ImplicitlyEnabled")
+	}
+
 	if len(implicitlyEnabled) > 0 {
 		message := "The following capabilities could not be disabled: "
 		caps := make([]string, len(implicitlyEnabled))
@@ -484,7 +463,7 @@ func setImplicitlyEnabledCapabilitiesCondition(cvStatus *configv1.ClusterVersion
 		message = message + strings.Join([]string(caps), ", ")
 
 		resourcemerge.SetOperatorStatusCondition(&cvStatus.Conditions, configv1.ClusterOperatorStatusCondition{
-			Type:               ImplicitlyEnabledCapabilities,
+			Type:               internal.ImplicitlyEnabledCapabilities,
 			Status:             configv1.ConditionTrue,
 			Reason:             "CapabilitiesImplicitlyEnabled",
 			Message:            message,
@@ -492,7 +471,7 @@ func setImplicitlyEnabledCapabilitiesCondition(cvStatus *configv1.ClusterVersion
 		})
 	} else {
 		resourcemerge.SetOperatorStatusCondition(&cvStatus.Conditions, configv1.ClusterOperatorStatusCondition{
-			Type:               ImplicitlyEnabledCapabilities,
+			Type:               internal.ImplicitlyEnabledCapabilities,
 			Status:             configv1.ConditionFalse,
 			Reason:             "AsExpected",
 			Message:            "Capabilities match configured spec",
@@ -501,10 +480,10 @@ func setImplicitlyEnabledCapabilitiesCondition(cvStatus *configv1.ClusterVersion
 	}
 }
 
-func setDesiredReleaseAcceptedCondition(cvStatus *configv1.ClusterVersionStatus, status LoadPayloadStatus, now metav1.Time) {
+func setReleaseAcceptedCondition(cvStatus *configv1.ClusterVersionStatus, status LoadPayloadStatus, now metav1.Time) {
 	if status.Step == "PayloadLoaded" {
 		resourcemerge.SetOperatorStatusCondition(&cvStatus.Conditions, configv1.ClusterOperatorStatusCondition{
-			Type:               DesiredReleaseAccepted,
+			Type:               internal.ReleaseAccepted,
 			Status:             configv1.ConditionTrue,
 			Reason:             status.Step,
 			Message:            status.Message,
@@ -513,7 +492,7 @@ func setDesiredReleaseAcceptedCondition(cvStatus *configv1.ClusterVersionStatus,
 	} else if status.Step != "" {
 		if status.Failure != nil {
 			resourcemerge.SetOperatorStatusCondition(&cvStatus.Conditions, configv1.ClusterOperatorStatusCondition{
-				Type:               DesiredReleaseAccepted,
+				Type:               internal.ReleaseAccepted,
 				Status:             configv1.ConditionFalse,
 				Reason:             status.Step,
 				Message:            status.Message,
@@ -521,7 +500,7 @@ func setDesiredReleaseAcceptedCondition(cvStatus *configv1.ClusterVersionStatus,
 			})
 		} else {
 			resourcemerge.SetOperatorStatusCondition(&cvStatus.Conditions, configv1.ClusterOperatorStatusCondition{
-				Type:               DesiredReleaseAccepted,
+				Type:               internal.ReleaseAccepted,
 				Status:             configv1.ConditionUnknown,
 				Reason:             status.Step,
 				Message:            status.Message,
@@ -530,6 +509,8 @@ func setDesiredReleaseAcceptedCondition(cvStatus *configv1.ClusterVersionStatus,
 		}
 	}
 }
+
+const slowCOUpdatePrefix = "Slow::"
 
 // convertErrorToProgressing returns true if the provided status indicates a failure condition can be interpreted as
 // still making internal progress. The general error we try to suppress is an operator or operators still being
@@ -549,28 +530,67 @@ func convertErrorToProgressing(now time.Time, statusFailure error) (reason strin
 	case payload.UpdateEffectReport:
 		return uErr.Reason, uErr.Error(), false
 	case payload.UpdateEffectNone:
-		return uErr.Reason, fmt.Sprintf("waiting on %s", uErr.Name), true
+		return convertErrorToProgressingForUpdateEffectNone(uErr, now)
 	case payload.UpdateEffectFail:
 		return "", "", false
 	case payload.UpdateEffectFailAfterInterval:
-		var exceeded []string
-		threshold := now.Add(-(40 * time.Minute))
-		names := uErr.Names
-		if len(names) == 0 {
-			names = []string{uErr.Name}
+		return convertErrorToProgressingForUpdateEffectFailAfterInterval(uErr, now)
+	}
+	return "", "", false
+}
+
+func convertErrorToProgressingForUpdateEffectNone(uErr *payload.UpdateError, now time.Time) (string, string, bool) {
+	var exceeded []string
+	names := uErr.Names
+	if len(names) == 0 {
+		names = []string{uErr.Name}
+	}
+	var machineConfig bool
+	for _, name := range names {
+		m := 30 * time.Minute
+		// It takes longer to upgrade MCO
+		if name == "machine-config" {
+			m = 3 * m
 		}
-		for _, name := range names {
-			if payload.COUpdateStartTimesGet(name).Before(threshold) {
+		t := payload.COUpdateStartTimesGet(name)
+		if (!t.IsZero()) && t.Before(now.Add(-(m))) {
+			if name == "machine-config" {
+				machineConfig = true
+			} else {
 				exceeded = append(exceeded, name)
 			}
 		}
-		if len(exceeded) > 0 {
-			return uErr.Reason, fmt.Sprintf("wait has exceeded 40 minutes for these operators: %s", strings.Join(exceeded, ", ")), false
-		} else {
-			return uErr.Reason, fmt.Sprintf("waiting up to 40 minutes on %s", uErr.Name), true
+	}
+	// returns true in those slow cases because it is still only a suspicion
+	if len(exceeded) > 0 && !machineConfig {
+		return slowCOUpdatePrefix + uErr.Reason, fmt.Sprintf("waiting on %s over 30 minutes which is longer than expected", strings.Join(exceeded, ", ")), true
+	}
+	if len(exceeded) > 0 && machineConfig {
+		return slowCOUpdatePrefix + uErr.Reason, fmt.Sprintf("waiting on %s over 30 minutes and machine-config over 90 minutes which is longer than expected", strings.Join(exceeded, ", ")), true
+	}
+	if len(exceeded) == 0 && machineConfig {
+		return slowCOUpdatePrefix + uErr.Reason, "waiting on machine-config over 90 minutes which is longer than expected", true
+	}
+	return uErr.Reason, fmt.Sprintf("waiting on %s", strings.Join(names, ", ")), true
+}
+
+func convertErrorToProgressingForUpdateEffectFailAfterInterval(uErr *payload.UpdateError, now time.Time) (string, string, bool) {
+	var exceeded []string
+	threshold := now.Add(-(40 * time.Minute))
+	names := uErr.Names
+	if len(names) == 0 {
+		names = []string{uErr.Name}
+	}
+	for _, name := range names {
+		if payload.COUpdateStartTimesGet(name).Before(threshold) {
+			exceeded = append(exceeded, name)
 		}
 	}
-	return "", "", false
+	if len(exceeded) > 0 {
+		return uErr.Reason, fmt.Sprintf("wait has exceeded 40 minutes for these operators: %s", strings.Join(exceeded, ", ")), false
+	} else {
+		return uErr.Reason, fmt.Sprintf("waiting up to 40 minutes on %s", uErr.Name), true
+	}
 }
 
 // syncFailingStatus handles generic errors in the cluster version. It tries to preserve
@@ -605,7 +625,7 @@ func (optr *Operator) syncFailingStatus(ctx context.Context, original *configv1.
 
 	// reset the failing message
 	resourcemerge.SetOperatorStatusCondition(&config.Status.Conditions, configv1.ClusterOperatorStatusCondition{
-		Type:               ClusterStatusFailing,
+		Type:               internal.ClusterStatusFailing,
 		Status:             configv1.ConditionTrue,
 		Message:            ierr.Error(),
 		LastTransitionTime: now,

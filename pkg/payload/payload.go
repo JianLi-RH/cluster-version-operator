@@ -10,8 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
-	"strings"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -22,10 +20,12 @@ import (
 	"github.com/blang/semver/v4"
 	configv1 "github.com/openshift/api/config/v1"
 	imagev1 "github.com/openshift/api/image/v1"
+	"github.com/openshift/library-go/pkg/manifest"
 
 	"github.com/openshift/cluster-version-operator/lib/capability"
+	localmanifest "github.com/openshift/cluster-version-operator/lib/manifest"
 	"github.com/openshift/cluster-version-operator/lib/resourceread"
-	"github.com/openshift/library-go/pkg/manifest"
+	"github.com/openshift/cluster-version-operator/pkg/cincinnati"
 )
 
 // State describes the state of the payload and alters
@@ -67,9 +67,6 @@ const (
 	// provide better visibility during install and upgrade of
 	// error conditions.
 	PrecreatingPayload
-
-	// releaseMultiArchID identifies a multi architecture release.
-	releaseMultiArchID = "multi"
 )
 
 // Initializing is true if the state is InitializingPayload.
@@ -140,11 +137,21 @@ type metadata struct {
 
 func LoadUpdate(dir, releaseImage, excludeIdentifier string, requiredFeatureSet string, profile string,
 	knownCapabilities []configv1.ClusterVersionCapability) (*Update, error) {
+	klog.V(2).Infof("Loading updatepayload from %q", dir)
+	if err := ValidateDirectory(dir); err != nil {
+		return nil, err
+	}
+	var (
+		cvoDir     = filepath.Join(dir, CVOManifestDir)
+		releaseDir = filepath.Join(dir, ReleaseManifestDir)
+	)
 
-	payload, tasks, err := loadUpdatePayloadMetadata(dir, releaseImage, profile)
+	payload, err := loadPayloadMetadata(releaseDir, releaseImage)
 	if err != nil {
 		return nil, err
 	}
+
+	tasks := loadPayloadTasks(releaseDir, cvoDir, releaseImage, profile)
 
 	var onlyKnownCaps *configv1.ClusterVersionCapabilitiesStatus
 
@@ -236,44 +243,14 @@ func LoadUpdate(dir, releaseImage, excludeIdentifier string, requiredFeatureSet 
 // the current payload the updated manifest's capabilities are checked to see if any must be implicitly enabled.
 // All capabilities requiring implicit enablement are returned.
 func GetImplicitlyEnabledCapabilities(updatePayloadManifests []manifest.Manifest, currentPayloadManifests []manifest.Manifest,
-	capabilities capability.ClusterCapabilities) []configv1.ClusterVersionCapability {
-
+	capabilities capability.ClusterCapabilities) sets.Set[configv1.ClusterVersionCapability] {
 	clusterCaps := capability.GetCapabilitiesStatus(capabilities)
-
-	// Initialize so it contains existing implicitly enabled capabilities
-	implicitlyEnabledCaps := capabilities.ImplicitlyEnabledCapabilities
-
-	for _, updateManifest := range updatePayloadManifests {
-		updateManErr := updateManifest.IncludeAllowUnknownCapabilities(nil, nil, nil, &clusterCaps, nil, true)
-
-		// update manifest is enabled, no need to check
-		if updateManErr == nil {
-			continue
-		}
-		for _, currentManifest := range currentPayloadManifests {
-			if !updateManifest.SameResourceID(currentManifest) {
-				continue
-			}
-
-			// current manifest is disabled, no need to check
-			if err := currentManifest.IncludeAllowUnknownCapabilities(nil, nil, nil, &clusterCaps, nil, true); err != nil {
-				continue
-			}
-			caps := capability.GetImplicitlyEnabledCapabilities(currentManifest.GetManifestCapabilities(),
-				updateManifest.GetManifestCapabilities(), capabilities)
-
-			capStrings := make([]string, len(caps))
-			for i, c := range caps {
-				capStrings[i] = string(c)
-				if !capability.Contains(implicitlyEnabledCaps, c) {
-					implicitlyEnabledCaps = append(implicitlyEnabledCaps, c)
-				}
-			}
-			klog.V(2).Infof("%s has changed and is now part of one or more disabled capabilities. The following capabilities will be implicitly enabled: %s",
-				getManifestResourceId(updateManifest), strings.Join(capStrings, ", "))
-		}
-	}
-	return implicitlyEnabledCaps
+	return localmanifest.GetImplicitlyEnabledCapabilities(
+		updatePayloadManifests,
+		currentPayloadManifests,
+		localmanifest.InclusionConfiguration{Capabilities: &clusterCaps},
+		capabilities.ImplicitlyEnabled,
+	)
 }
 
 // ValidateDirectory checks if a directory can be a candidate update by
@@ -295,47 +272,43 @@ func ValidateDirectory(dir string) error {
 	return nil
 }
 
+func loadPayloadMetadata(releaseDir, releaseImage string) (*Update, error) {
+	release, err := loadReleaseMetadata(releaseDir)
+	if err != nil {
+		return nil, err
+	}
+
+	arch := string(release.Architecture)
+	if arch == "" {
+		arch = runtime.GOARCH
+		klog.V(2).Infof("Architecture from %s (%s) retrieved from runtime: %q", cincinnatiJSONFile, release.Version, arch)
+	}
+
+	release.Image = releaseImage
+
+	imageRef, err := loadImageReferences(releaseDir)
+	if err != nil {
+		return nil, err
+	}
+
+	if imageRef.Name != release.Version {
+		return nil, fmt.Errorf("Version from %s (%s) differs from %s (%s)", imageReferencesFile, imageRef.Name, cincinnatiJSONFile, release.Version)
+	}
+
+	return &Update{
+		Release:      release,
+		ImageRef:     imageRef,
+		Architecture: arch,
+	}, nil
+}
+
 type payloadTasks struct {
 	idir       string
 	preprocess func([]byte) ([]byte, error)
 	skipFiles  sets.Set[string]
 }
 
-func loadUpdatePayloadMetadata(dir, releaseImage, clusterProfile string) (*Update, []payloadTasks, error) {
-	klog.V(2).Infof("Loading updatepayload from %q", dir)
-	if err := ValidateDirectory(dir); err != nil {
-		return nil, nil, err
-	}
-	var (
-		cvoDir     = filepath.Join(dir, CVOManifestDir)
-		releaseDir = filepath.Join(dir, ReleaseManifestDir)
-	)
-
-	release, arch, err := loadReleaseFromMetadata(releaseDir)
-	if err != nil {
-		return nil, nil, err
-	}
-	release.Image = releaseImage
-
-	imageRef, err := loadImageReferences(releaseDir)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	if imageRef.Name != release.Version {
-		return nil, nil, fmt.Errorf("Version from %s (%s) differs from %s (%s)", imageReferencesFile, imageRef.Name, cincinnatiJSONFile, release.Version)
-	}
-
-	tasks := getPayloadTasks(releaseDir, cvoDir, releaseImage, clusterProfile)
-
-	return &Update{
-		Release:      release,
-		ImageRef:     imageRef,
-		Architecture: arch,
-	}, tasks, nil
-}
-
-func getPayloadTasks(releaseDir, cvoDir, releaseImage, clusterProfile string) []payloadTasks {
+func loadPayloadTasks(releaseDir, cvoDir, releaseImage, clusterProfile string) []payloadTasks {
 	cjf := filepath.Join(releaseDir, cincinnatiJSONFile)
 	irf := filepath.Join(releaseDir, imageReferencesFile)
 
@@ -355,68 +328,50 @@ func getPayloadTasks(releaseDir, cvoDir, releaseImage, clusterProfile string) []
 	}}
 }
 
-func loadReleaseFromMetadata(releaseDir string) (configv1.Release, string, error) {
+// RootPath represents a path to the directory containing the payload
+type RootPath string
+
+const DefaultRootPath = RootPath(DefaultPayloadDir)
+
+// LoadReleaseMetadata loads the release metadata from the appropriate location inside the payload directory
+func (p RootPath) LoadReleaseMetadata() (configv1.Release, error) {
+	releaseDir := filepath.Join(string(p), ReleaseManifestDir)
+	return loadReleaseMetadata(releaseDir)
+}
+
+func loadReleaseMetadata(releaseDir string) (configv1.Release, error) {
 	var release configv1.Release
 	path := filepath.Join(releaseDir, cincinnatiJSONFile)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return release, "", err
+		return release, err
 	}
 
 	var metadata metadata
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		return release, "", fmt.Errorf("unmarshal Cincinnati metadata: %w", err)
+		return release, fmt.Errorf("unmarshal Cincinnati metadata: %w", err)
 	}
 
 	if metadata.Kind != "cincinnati-metadata-v0" {
-		return release, "", fmt.Errorf("unrecognized Cincinnati metadata kind %q", metadata.Kind)
+		return release, fmt.Errorf("unrecognized Cincinnati metadata kind %q", metadata.Kind)
 	}
 
 	if metadata.Version == "" {
-		return release, "", errors.New("missing required Cincinnati metadata version")
+		return release, errors.New("missing required Cincinnati metadata version")
 	}
 
 	if _, err := semver.Parse(metadata.Version); err != nil {
-		return release, "", fmt.Errorf("Cincinnati metadata version %q is not a valid semantic version: %v", metadata.Version, err)
+		return release, fmt.Errorf("Cincinnati metadata version %q is not a valid semantic version: %v", metadata.Version, err)
+	}
+
+	release, err = cincinnati.ParseMetadata(metadata.Metadata)
+	if err != nil {
+		klog.Warningf("errors while parsing metadata from %s (%s): %v", cincinnatiJSONFile, release.Version, err)
 	}
 
 	release.Version = metadata.Version
 
-	var arch string
-	if archInterface, ok := metadata.Metadata["release.openshift.io/architecture"]; ok {
-		if archString, ok := archInterface.(string); ok {
-			if archString == releaseMultiArchID {
-				arch = string(configv1.ClusterVersionArchitectureMulti)
-			} else {
-				return release, "", fmt.Errorf("Architecture from %s (%s) contains invalid value: %q. Valid value is %q.",
-					cincinnatiJSONFile, release.Version, archString, releaseMultiArchID)
-			}
-			klog.V(2).Infof("Architecture from %s (%s) is multi: %q", cincinnatiJSONFile, release.Version, archString)
-		} else {
-			return release, "", fmt.Errorf("Architecture from %s (%s) is not a string: %v",
-				cincinnatiJSONFile, release.Version, archInterface)
-		}
-	} else {
-		arch = runtime.GOARCH
-		klog.V(2).Infof("Architecture from %s (%s) retrieved from runtime: %q", cincinnatiJSONFile, release.Version, arch)
-	}
-	if urlInterface, ok := metadata.Metadata["url"]; ok {
-		if urlString, ok := urlInterface.(string); ok {
-			release.URL = configv1.URL(urlString)
-		} else {
-			klog.Warningf("URL from %s (%s) is not a string: %v", cincinnatiJSONFile, release.Version, urlInterface)
-		}
-	}
-	if channelsInterface, ok := metadata.Metadata["io.openshift.upgrades.graph.release.channels"]; ok {
-		if channelsString, ok := channelsInterface.(string); ok {
-			release.Channels = strings.Split(channelsString, ",")
-			sort.Strings(release.Channels)
-		} else {
-			klog.Warningf("channel list from %s (%s) is not a string: %v", cincinnatiJSONFile, release.Version, channelsInterface)
-		}
-	}
-
-	return release, arch, nil
+	return release, nil
 }
 
 func loadImageReferences(releaseDir string) (*imagev1.ImageStream, error) {

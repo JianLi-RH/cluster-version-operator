@@ -13,13 +13,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	configlistersv1 "github.com/openshift/client-go/config/listers/config/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/informers"
+	"k8s.io/apimachinery/pkg/util/sets"
+	coreinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	coreclientsetv1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -33,13 +33,16 @@ import (
 
 	configv1 "github.com/openshift/api/config/v1"
 	clientset "github.com/openshift/client-go/config/clientset/versioned"
-	"github.com/openshift/client-go/config/informers/externalversions"
+	configinformers "github.com/openshift/client-go/config/informers/externalversions"
+	operatorclientset "github.com/openshift/client-go/operator/clientset/versioned"
+	operatorinformers "github.com/openshift/client-go/operator/informers/externalversions"
 	"github.com/openshift/library-go/pkg/config/clusterstatus"
 	libgoleaderelection "github.com/openshift/library-go/pkg/config/leaderelection"
 
 	"github.com/openshift/cluster-version-operator/pkg/autoupdate"
 	"github.com/openshift/cluster-version-operator/pkg/clusterconditions"
 	"github.com/openshift/cluster-version-operator/pkg/cvo"
+	"github.com/openshift/cluster-version-operator/pkg/cvo/configuration"
 	"github.com/openshift/cluster-version-operator/pkg/featuregates"
 	"github.com/openshift/cluster-version-operator/pkg/internal"
 	"github.com/openshift/cluster-version-operator/pkg/payload"
@@ -79,6 +82,8 @@ type Options struct {
 	Exclude string
 
 	ClusterProfile string
+
+	HyperShift bool
 
 	// AlwaysEnableCapabilities is a list of cluster version capabilities
 	// which will always be implicitly enabled.
@@ -126,7 +131,7 @@ func NewOptions() *Options {
 	}
 }
 
-func (o *Options) Run(ctx context.Context) error {
+func (o *Options) ValidateAndComplete() error {
 	if o.NodeName == "" {
 		return fmt.Errorf("node-name is required")
 	}
@@ -146,22 +151,29 @@ func (o *Options) Run(ctx context.Context) error {
 		(o.PromQLTarget.KubeSvc.Namespace == "" || o.PromQLTarget.KubeSvc.Name == "") {
 		return fmt.Errorf("--use-dns-for-services is disabled, so --metrics-service and --metrics-namespace must be set")
 	}
+
+	if parsed, err := url.Parse(o.PrometheusURLString); err != nil {
+		return fmt.Errorf("error parsing promql url: %v", err)
+	} else {
+		o.PromQLTarget.URL = parsed
+	}
+
+	// Inject the cluster ID into PromQL queries in HyperShift
+	o.InjectClusterIdIntoPromQL = o.HyperShift
+
+	if err := validateCapabilities(o.AlwaysEnableCapabilities); err != nil {
+		return fmt.Errorf("--always-enable-capabilities: %w", err)
+	}
+
+	return nil
+}
+
+func (o *Options) Run(ctx context.Context) error {
 	if len(o.PayloadOverride) > 0 {
 		klog.Warningf("Using an override payload directory for testing only: %s", o.PayloadOverride)
 	}
 	if len(o.Exclude) > 0 {
 		klog.Infof("Excluding manifests for %q", o.Exclude)
-	}
-	alwaysEnableCaps, unknownCaps := parseAlwaysEnableCapabilities(o.AlwaysEnableCapabilities)
-	if len(unknownCaps) > 0 {
-		return fmt.Errorf("--always-enable-capabilities was set with unknown capabilities: %v", unknownCaps)
-	}
-
-	// parse the prometheus url
-	var err error
-	o.PromQLTarget.URL, err = url.Parse(o.PrometheusURLString)
-	if err != nil {
-		return fmt.Errorf("error parsing promql url: %v", err)
 	}
 
 	// initialize the core objects
@@ -175,14 +187,106 @@ func (o *Options) Run(ctx context.Context) error {
 		return err
 	}
 
+	clusterVersionConfigInformerFactory, configInformerFactory := o.prepareConfigInformerFactories(cb)
+	startingFeatureSet, startingCvoGates, err := o.processInitialFeatureGate(ctx, configInformerFactory)
+	if err != nil {
+		return fmt.Errorf("error processing feature gates: %w", err)
+	}
+
 	// initialize the controllers and attempt to load the payload information
-	controllerCtx, err := o.NewControllerContext(cb, alwaysEnableCaps)
+	controllerCtx, err := o.NewControllerContext(cb, startingFeatureSet, startingCvoGates, clusterVersionConfigInformerFactory, configInformerFactory)
 	if err != nil {
 		return err
 	}
 	o.leaderElection = getLeaderElectionConfig(ctx, cb.RestConfig(defaultQPS))
 	o.run(ctx, controllerCtx, lock, cb.RestConfig(defaultQPS), cb.RestConfig(highQPS))
 	return nil
+}
+
+func (o *Options) prepareConfigInformerFactories(cb *ClientBuilder) (configinformers.SharedInformerFactory, configinformers.SharedInformerFactory) {
+	client := cb.ClientOrDie("shared-informer")
+	filterByName := func(opts *metav1.ListOptions) {
+		opts.FieldSelector = fields.OneTermEqualSelector("metadata.name", o.Name).String()
+	}
+	clusterVersionConfigInformerFactory := configinformers.NewSharedInformerFactoryWithOptions(client, resyncPeriod(o.ResyncInterval), configinformers.WithTweakListOptions(filterByName))
+	configInformerFactory := configinformers.NewSharedInformerFactory(client, resyncPeriod(o.ResyncInterval))
+
+	return clusterVersionConfigInformerFactory, configInformerFactory
+}
+
+// getOpenShiftVersion peeks at the local release metadata to determine the version of OpenShift this CVO belongs to.
+// This assumes the CVO is executing in a container from the payload image. This does not and should not fully load
+// whole payload content, that is only loaded later once leader lease is acquired. Here we should only read as little
+// data as possible to determine the version so we can establish enabled feature gate checker for all following code.
+func (o *Options) getOpenShiftVersion() string {
+	payloadRoot := payload.DefaultRootPath
+	if o.PayloadOverride != "" {
+		payloadRoot = payload.RootPath(o.PayloadOverride)
+	}
+
+	// We cannot refuse to start CVO if for some reason we cannot determine the OpenShift version on startup from the local
+	// release metadata. The only consequence is we fail to determine enabled/disabled feature gates and will have to use
+	// some defaults.
+	releaseMetadata, err := payloadRoot.LoadReleaseMetadata()
+	if err != nil {
+		klog.Warningf("Failed to read release metadata to determine OpenShift version for this CVO (will use placeholder version %q): %v", featuregates.StubOpenShiftVersion, err)
+		return featuregates.StubOpenShiftVersion
+	}
+
+	if releaseMetadata.Version == "" {
+		klog.Warningf("Version missing from release metadata, cannot determine OpenShift version for this CVO (will use placeholder version %q)", featuregates.StubOpenShiftVersion)
+		return featuregates.StubOpenShiftVersion
+	}
+
+	klog.Infof("Determined OpenShift version for this CVO: %q", releaseMetadata.Version)
+	return releaseMetadata.Version
+}
+
+func (o *Options) processInitialFeatureGate(ctx context.Context, configInformerFactory configinformers.SharedInformerFactory) (configv1.FeatureSet, featuregates.CvoGates, error) {
+	var startingFeatureSet configv1.FeatureSet
+	var cvoGates featuregates.CvoGates
+
+	featureGates := configInformerFactory.Config().V1().FeatureGates().Lister()
+	configInformerFactory.Start(ctx.Done())
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	for key, synced := range configInformerFactory.WaitForCacheSync(ctx.Done()) {
+		if !synced {
+			return startingFeatureSet, cvoGates, fmt.Errorf("failed to sync %s informer cache: %w", key.String(), ctx.Err())
+		}
+	}
+
+	cvoOpenShiftVersion := o.getOpenShiftVersion()
+	cvoGates = featuregates.DefaultCvoGates(cvoOpenShiftVersion)
+
+	var clusterFeatureGate *configv1.FeatureGate
+
+	gate, err := featureGates.Get("cluster")
+	switch {
+	case apierrors.IsNotFound(err):
+		// if we have no featuregates, then the cluster is using the default featureset, which is "".
+		// This excludes everything that could possibly depend on a different feature set.
+		startingFeatureSet = ""
+		klog.Infof("FeatureGate not found in cluster, will assume default feature set %q at startup", startingFeatureSet)
+	case err != nil:
+		// This should not happen because featureGates is backed by the informer cache which successfully synced earlier
+		klog.Errorf("Failed to get FeatureGate from cluster: %v", err)
+		return startingFeatureSet, cvoGates, fmt.Errorf("failed to get FeatureGate from informer cache: %w", err)
+	default:
+		clusterFeatureGate = gate
+		startingFeatureSet = gate.Spec.FeatureSet
+		cvoGates = featuregates.CvoGatesFromFeatureGate(clusterFeatureGate, cvoOpenShiftVersion)
+		klog.Infof("FeatureGate found in cluster, using its feature set %q at startup", startingFeatureSet)
+	}
+
+	if cvoGates.UnknownVersion() {
+		klog.Warningf("CVO features for version %s could not be detected from FeatureGate; will use defaults plus special UnknownVersion feature gate", cvoOpenShiftVersion)
+	}
+	klog.Infof("CVO features for version %s enabled at startup: %+v", cvoOpenShiftVersion, cvoGates)
+
+	return startingFeatureSet, cvoGates, nil
 }
 
 // run launches a number of goroutines to handle manifest application,
@@ -216,12 +320,13 @@ func (o *Options) run(ctx context.Context, controllerCtx *Context, lock resource
 
 	informersDone := postMainContext.Done()
 	// FIXME: would be nice if there was a way to collect these.
-	controllerCtx.CVInformerFactory.Start(informersDone)
+	controllerCtx.ClusterVersionInformerFactory.Start(informersDone)
 	controllerCtx.OpenshiftConfigInformerFactory.Start(informersDone)
 	controllerCtx.OpenshiftConfigManagedInformerFactory.Start(informersDone)
-	controllerCtx.InformerFactory.Start(informersDone)
+	controllerCtx.ConfigInformerFactory.Start(informersDone)
+	controllerCtx.OperatorInformerFactory.Start(informersDone)
 
-	allSynced := controllerCtx.CVInformerFactory.WaitForCacheSync(informersDone)
+	allSynced := controllerCtx.ClusterVersionInformerFactory.WaitForCacheSync(informersDone)
 	for _, synced := range allSynced {
 		if !synced {
 			klog.Fatalf("Caches never synchronized: %v", postMainContext.Err())
@@ -245,11 +350,12 @@ func (o *Options) run(ctx context.Context, controllerCtx *Context, lock resource
 						resultChannelCount++
 						go func() {
 							defer utilruntime.HandleCrash()
-							err := cvo.RunMetrics(postMainContext, shutdownContext, o.ListenAddr, o.ServingCertFile, o.ServingKeyFile)
+							disableMetricsAuth := o.InjectClusterIdIntoPromQL // this is wired to the "--hypershift" flag, so when hypershfit is no, we disableMetricsAuth
+							err := cvo.RunMetrics(postMainContext, shutdownContext, o.ListenAddr, o.ServingCertFile, o.ServingKeyFile, restConfig, disableMetricsAuth)
 							resultChannel <- asyncResult{name: "metrics server", error: err}
 						}()
 					}
-					if err := controllerCtx.InitializeFromPayload(runContext, restConfig, burstRestConfig); err != nil {
+					if err := controllerCtx.CVO.InitializeFromPayload(runContext, restConfig, burstRestConfig); err != nil {
 						if firstError == nil {
 							firstError = err
 						}
@@ -390,6 +496,10 @@ func (cb *ClientBuilder) KubeClientOrDie(name string, configFns ...func(*rest.Co
 	return kubernetes.NewForConfigOrDie(rest.AddUserAgent(cb.RestConfig(configFns...), name))
 }
 
+func (cb *ClientBuilder) OperatorClientOrDie(name string, configFns ...func(*rest.Config)) operatorclientset.Interface {
+	return operatorclientset.NewForConfigOrDie(rest.AddUserAgent(cb.RestConfig(configFns...), name))
+}
+
 func newClientBuilder(kubeconfig string) (*ClientBuilder, error) {
 	clientCfg := clientcmd.NewDefaultClientConfigLoadingRules()
 	clientCfg.ExplicitPath = kubeconfig
@@ -445,77 +555,96 @@ type Context struct {
 	AutoUpdate              *autoupdate.Controller
 	StopOnFeatureGateChange *featuregates.ChangeStopper
 
-	CVInformerFactory                     externalversions.SharedInformerFactory
-	OpenshiftConfigInformerFactory        informers.SharedInformerFactory
-	OpenshiftConfigManagedInformerFactory informers.SharedInformerFactory
-	InformerFactory                       externalversions.SharedInformerFactory
-
-	fgLister configlistersv1.FeatureGateLister
+	// ClusterVersionInformerFactory should be used to get informers / listers for code that works with ClusterVersion resource
+	// singleton in the cluster.
+	ClusterVersionInformerFactory configinformers.SharedInformerFactory
+	// ConfigInformerFactory should be used to get informers / listers for code that works with resources from the
+	// config.openshift.io group, _except_ the ClusterVersion resource singleton.
+	ConfigInformerFactory configinformers.SharedInformerFactory
+	// OpenshiftConfigManagedInformerFactory should be used to get informers / listers for code that works with core k8s
+	// resources in the openshift-config namespace.
+	OpenshiftConfigInformerFactory coreinformers.SharedInformerFactory
+	// OpenshiftConfigManagedInformerFactory should be used to get informers / listers for code that works with core k8s
+	// resources in the openshift-config-managed namespace.
+	OpenshiftConfigManagedInformerFactory coreinformers.SharedInformerFactory
+	// OperatorInformerFactory should be used to get informers / listers for code that works with resources from the
+	// operator.openshift.io group
+	OperatorInformerFactory operatorinformers.SharedInformerFactory
 }
 
 // NewControllerContext initializes the default Context for the current Options. It does
 // not start any background processes.
-func (o *Options) NewControllerContext(cb *ClientBuilder, alwaysEnableCapabilities []configv1.ClusterVersionCapability) (*Context, error) {
-	client := cb.ClientOrDie("shared-informer")
+func (o *Options) NewControllerContext(
+	cb *ClientBuilder,
+	startingFeatureSet configv1.FeatureSet,
+	startingCvoGates featuregates.CvoGates,
+	clusterVersionConfigInformerFactory,
+	configInformerFactory configinformers.SharedInformerFactory,
+) (*Context, error) {
 	kubeClient := cb.KubeClientOrDie(internal.ConfigNamespace, useProtobuf)
+	openshiftConfigInformerFactory := coreinformers.NewSharedInformerFactoryWithOptions(kubeClient, resyncPeriod(o.ResyncInterval), coreinformers.WithNamespace(internal.ConfigNamespace))
+	openshiftConfigManagedInformerFactory := coreinformers.NewSharedInformerFactoryWithOptions(kubeClient, resyncPeriod(o.ResyncInterval), coreinformers.WithNamespace(internal.ConfigManagedNamespace))
 
-	cvInformer := externalversions.NewFilteredSharedInformerFactory(client, resyncPeriod(o.ResyncInterval), "", func(opts *metav1.ListOptions) {
-		opts.FieldSelector = fmt.Sprintf("metadata.name=%s", o.Name)
-	})
-	openshiftConfigInformer := informers.NewSharedInformerFactoryWithOptions(kubeClient, resyncPeriod(o.ResyncInterval), informers.WithNamespace(internal.ConfigNamespace))
-	openshiftConfigManagedInformer := informers.NewSharedInformerFactoryWithOptions(kubeClient, resyncPeriod(o.ResyncInterval), informers.WithNamespace(internal.ConfigManagedNamespace))
+	operatorClient := cb.OperatorClientOrDie("operator-client")
+	filterByName := func(opts *metav1.ListOptions) {
+		opts.FieldSelector = fields.OneTermEqualSelector("metadata.name", configuration.ClusterVersionOperatorConfigurationName).String()
+	}
+	operatorInformerFactory := operatorinformers.NewSharedInformerFactoryWithOptions(operatorClient, o.ResyncInterval, operatorinformers.WithTweakListOptions(filterByName))
 
-	sharedInformers := externalversions.NewSharedInformerFactory(client, resyncPeriod(o.ResyncInterval))
-
-	coInformer := sharedInformers.Config().V1().ClusterOperators()
+	coInformer := configInformerFactory.Config().V1().ClusterOperators()
 
 	cvoKubeClient := cb.KubeClientOrDie(o.Namespace, useProtobuf)
 	o.PromQLTarget.KubeClient = cvoKubeClient
+
 	cvo, err := cvo.New(
 		o.NodeName,
 		o.Namespace, o.Name,
 		o.ReleaseImage,
 		o.PayloadOverride,
 		resyncPeriod(o.ResyncInterval),
-		cvInformer.Config().V1().ClusterVersions(),
+		clusterVersionConfigInformerFactory.Config().V1().ClusterVersions(),
 		coInformer,
-		openshiftConfigInformer.Core().V1().ConfigMaps(),
-		openshiftConfigManagedInformer.Core().V1().ConfigMaps(),
-		sharedInformers.Config().V1().Proxies(),
+		openshiftConfigInformerFactory.Core().V1().ConfigMaps(),
+		openshiftConfigManagedInformerFactory.Core().V1().ConfigMaps(),
+		configInformerFactory.Config().V1().Proxies(),
+		operatorInformerFactory,
 		cb.ClientOrDie(o.Namespace),
 		cvoKubeClient,
+		operatorClient,
 		o.Exclude,
 		o.ClusterProfile,
+		o.HyperShift,
 		o.PromQLTarget,
 		o.InjectClusterIdIntoPromQL,
 		o.UpdateService,
-		alwaysEnableCapabilities,
+		stringsToCapabilities(o.AlwaysEnableCapabilities),
+		startingFeatureSet,
+		startingCvoGates,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	featureChangeStopper, err := featuregates.NewChangeStopper(sharedInformers.Config().V1().FeatureGates())
+	featureChangeStopper, err := featuregates.NewChangeStopper(configInformerFactory.Config().V1().FeatureGates(), startingFeatureSet, startingCvoGates)
 	if err != nil {
 		return nil, err
 	}
 
 	ctx := &Context{
-		CVInformerFactory:                     cvInformer,
-		OpenshiftConfigInformerFactory:        openshiftConfigInformer,
-		OpenshiftConfigManagedInformerFactory: openshiftConfigManagedInformer,
-		InformerFactory:                       sharedInformers,
+		ClusterVersionInformerFactory:         clusterVersionConfigInformerFactory,
+		ConfigInformerFactory:                 configInformerFactory,
+		OpenshiftConfigInformerFactory:        openshiftConfigInformerFactory,
+		OpenshiftConfigManagedInformerFactory: openshiftConfigManagedInformerFactory,
+		OperatorInformerFactory:               operatorInformerFactory,
 		CVO:                                   cvo,
 		StopOnFeatureGateChange:               featureChangeStopper,
-
-		fgLister: sharedInformers.Config().V1().FeatureGates().Lister(),
 	}
 
 	if o.EnableAutoUpdate {
 		ctx.AutoUpdate, err = autoupdate.New(
 			o.Namespace, o.Name,
-			cvInformer.Config().V1().ClusterVersions(),
-			sharedInformers.Config().V1().ClusterOperators(),
+			clusterVersionConfigInformerFactory.Config().V1().ClusterVersions(),
+			configInformerFactory.Config().V1().ClusterOperators(),
 			cb.ClientOrDie(o.Namespace),
 			cb.KubeClientOrDie(o.Namespace),
 		)
@@ -531,89 +660,22 @@ func (o *Options) NewControllerContext(cb *ClientBuilder, alwaysEnableCapabiliti
 	return ctx, nil
 }
 
-// InitializeFromPayload initializes the CVO and FeatureGate ChangeStoppers controllers from the payload. It extracts the
-// current CVO version from the initial payload and uses it to determine the initial the required featureset and enabled
-// feature gates. Both the payload and determined feature information are used to initialize CVO and feature gate
-// ChangeStopper controllers.
-func (c *Context) InitializeFromPayload(ctx context.Context, restConfig *rest.Config, burstRestConfig *rest.Config) error {
-	var startingFeatureSet configv1.FeatureSet
-	var clusterFeatureGate *configv1.FeatureGate
-
-	// client-go automatically retries some network blip errors on GETs for 30s by default, and we want to
-	// retry the remaining ones ourselves. If we fail longer than that, the operator won't be able to do work
-	// anyway. Return the error and crashloop.
-	//
-	// We implement the timeout with a context because the timeout in PollImmediateWithContext does not behave
-	// well when ConditionFunc takes longer time to execute, like here where the GET can be retried by client-go
-	var lastError error
-	if err := wait.PollUntilContextTimeout(context.Background(), 2*time.Second, 25*time.Second, true, func(ctx context.Context) (bool, error) {
-		gate, fgErr := c.fgLister.Get("cluster")
-		switch {
-		case apierrors.IsNotFound(fgErr):
-			// if we have no featuregates, then the cluster is using the default featureset, which is "".
-			// This excludes everything that could possibly depend on a different feature set.
-			startingFeatureSet = ""
-			klog.Infof("FeatureGate not found in cluster, using default feature set %q at startup", startingFeatureSet)
-			return true, nil
-		case fgErr != nil:
-			lastError = fgErr
-			klog.Warningf("Failed to get FeatureGate from cluster: %v", fgErr)
-			return false, nil
-		default:
-			clusterFeatureGate = gate
-			startingFeatureSet = gate.Spec.FeatureSet
-			klog.Infof("FeatureGate found in cluster, using its feature set %q at startup", startingFeatureSet)
-			return true, nil
-		}
-	}); err != nil {
-		if lastError != nil {
-			return lastError
-		}
-		return err
+func stringsToCapabilities(names []string) []configv1.ClusterVersionCapability {
+	caps := make([]configv1.ClusterVersionCapability, len(names))
+	for i, c := range names {
+		caps[i] = configv1.ClusterVersionCapability(c)
 	}
-
-	payload, err := c.CVO.LoadInitialPayload(ctx, startingFeatureSet, restConfig)
-	if err != nil {
-		return err
-	}
-
-	var cvoGates featuregates.CvoGates
-	if clusterFeatureGate != nil {
-		cvoGates = featuregates.CvoGatesFromFeatureGate(clusterFeatureGate, payload.Release.Version)
-	} else {
-		cvoGates = featuregates.DefaultCvoGates(payload.Release.Version)
-	}
-
-	if cvoGates.UnknownVersion() {
-		klog.Infof("CVO features for version %s could not be detected from FeatureGate; will use defaults plus special UnknownVersion feature gate", payload.Release.Version)
-	}
-	klog.Infof("CVO features for version %s enabled at startup: %+v", payload.Release.Version, cvoGates)
-
-	c.StopOnFeatureGateChange.SetStartingFeatures(startingFeatureSet, cvoGates)
-	c.CVO.InitializeFromPayload(payload, startingFeatureSet, cvoGates, restConfig, burstRestConfig)
-
-	return nil
+	return caps
 }
 
-// parseAlwaysEnableCapabilities parses the string list of capabilities
-// into two lists of configv1.ClusterVersionCapability: known and unknown.
-func parseAlwaysEnableCapabilities(caps []string) ([]configv1.ClusterVersionCapability, []configv1.ClusterVersionCapability) {
-	var (
-		knownCaps   []configv1.ClusterVersionCapability
-		unknownCaps []configv1.ClusterVersionCapability
-	)
-	for _, c := range caps {
-		known := false
-		for _, kc := range configv1.KnownClusterVersionCapabilities {
-			if configv1.ClusterVersionCapability(c) == kc {
-				knownCaps = append(knownCaps, kc)
-				known = true
-				break
-			}
-		}
-		if !known {
-			unknownCaps = append(unknownCaps, configv1.ClusterVersionCapability(c))
-		}
+func validateCapabilities(caps []string) error {
+	unknown := sets.New(caps...)
+	for _, kc := range configv1.KnownClusterVersionCapabilities {
+		unknown.Delete(string(kc))
 	}
-	return knownCaps, unknownCaps
+
+	if len(unknown) > 0 {
+		return fmt.Errorf("unknown capabilities: %s", sets.List(unknown))
+	}
+	return nil
 }

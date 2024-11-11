@@ -1,20 +1,29 @@
 package cvo
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
+	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 
 	configv1 "github.com/openshift/api/config/v1"
+
+	"github.com/openshift/cluster-version-operator/pkg/internal"
 )
 
 func Test_operatorMetrics_Collect(t *testing.T) {
@@ -322,8 +331,8 @@ func Test_operatorMetrics_Collect(t *testing.T) {
 							Status: configv1.ClusterOperatorStatus{
 								Conditions: []configv1.ClusterOperatorStatusCondition{
 									{Type: configv1.OperatorAvailable, Status: configv1.ConditionTrue},
-									{Type: configv1.ClusterStatusConditionType("Custom"), Status: configv1.ConditionFalse, Reason: "CustomReason"},
-									{Type: configv1.ClusterStatusConditionType("Unknown"), Status: configv1.ConditionUnknown},
+									{Type: "Custom", Status: configv1.ConditionFalse, Reason: "CustomReason"},
+									{Type: "Unknown", Status: configv1.ConditionUnknown},
 								},
 							},
 						},
@@ -472,7 +481,7 @@ func Test_operatorMetrics_Collect(t *testing.T) {
 									{State: configv1.CompletedUpdate, Version: "0.0.2", Image: "test/image:1", CompletionTime: &([]metav1.Time{{Time: time.Unix(2, 0)}}[0])},
 								},
 								Conditions: []configv1.ClusterOperatorStatusCondition{
-									{Type: ClusterStatusFailing, Status: configv1.ConditionTrue, LastTransitionTime: metav1.Time{Time: time.Unix(4, 0)}, Reason: "Because stuff"},
+									{Type: internal.ClusterStatusFailing, Status: configv1.ConditionTrue, LastTransitionTime: metav1.Time{Time: time.Unix(4, 0)}, Reason: "Because stuff"},
 								},
 							},
 						},
@@ -510,7 +519,7 @@ func Test_operatorMetrics_Collect(t *testing.T) {
 							},
 							Status: configv1.ClusterVersionStatus{
 								Conditions: []configv1.ClusterOperatorStatusCondition{
-									{Type: ClusterStatusFailing, Status: configv1.ConditionTrue, Reason: "Because stuff"},
+									{Type: internal.ClusterStatusFailing, Status: configv1.ConditionTrue, Reason: "Because stuff"},
 								},
 							},
 						},
@@ -710,7 +719,7 @@ func Test_operatorMetrics_CollectTransitions(t *testing.T) {
 					Status: configv1.ClusterOperatorStatus{
 						Conditions: []configv1.ClusterOperatorStatusCondition{
 							{Type: configv1.OperatorAvailable, Status: configv1.ConditionTrue},
-							{Type: configv1.ClusterStatusConditionType("Custom"), Status: configv1.ConditionFalse},
+							{Type: "Custom", Status: configv1.ConditionFalse},
 						},
 					},
 				},
@@ -719,8 +728,8 @@ func Test_operatorMetrics_CollectTransitions(t *testing.T) {
 					Status: configv1.ClusterOperatorStatus{
 						Conditions: []configv1.ClusterOperatorStatusCondition{
 							{Type: configv1.OperatorAvailable, Status: configv1.ConditionFalse},
-							{Type: configv1.ClusterStatusConditionType("Custom"), Status: configv1.ConditionFalse},
-							{Type: configv1.ClusterStatusConditionType("Unknown"), Status: configv1.ConditionUnknown},
+							{Type: "Custom", Status: configv1.ConditionFalse},
+							{Type: "Unknown", Status: configv1.ConditionUnknown},
 						},
 					},
 				},
@@ -728,8 +737,8 @@ func Test_operatorMetrics_CollectTransitions(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{Name: "test"},
 					Status: configv1.ClusterOperatorStatus{
 						Conditions: []configv1.ClusterOperatorStatusCondition{
-							{Type: configv1.ClusterStatusConditionType("Custom"), Status: configv1.ConditionTrue},
-							{Type: configv1.ClusterStatusConditionType("Unknown"), Status: configv1.ConditionTrue},
+							{Type: "Custom", Status: configv1.ConditionTrue},
+							{Type: "Unknown", Status: configv1.ConditionTrue},
 						},
 					},
 				},
@@ -1008,4 +1017,155 @@ func metricParts(t *testing.T, metric prometheus.Metric, labels ...string) strin
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+type fakeClient struct {
+}
+
+func (c *fakeClient) Create(_ context.Context, tokenReview *authenticationv1.TokenReview, _ metav1.CreateOptions) (*authenticationv1.TokenReview, error) {
+	if tokenReview != nil {
+		ret := tokenReview.DeepCopy()
+		if tokenReview.Spec.Token == "good" {
+			ret.Status.Authenticated = true
+			ret.Status.User.Username = "system:serviceaccount:openshift-monitoring:prometheus-k8s"
+		}
+		if tokenReview.Spec.Token == "authenticated" {
+			ret.Status.Authenticated = true
+		}
+		if tokenReview.Spec.Token == "error" {
+			return nil, errors.New("fake error")
+		}
+		return ret, nil
+	}
+	return nil, errors.New("nil input")
+}
+
+type okHandler struct {
+}
+
+func (h *okHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	_, _ = fmt.Fprintf(w, "ok")
+}
+
+func Test_authHandler(t *testing.T) {
+	tests := []struct {
+		name               string
+		handler            *authHandler
+		method             string
+		body               io.Reader
+		headerKey          string
+		headerValue        string
+		expectedStatusCode int
+		expectedBody       string
+	}{
+		{
+			name: "good",
+			handler: &authHandler{
+				ctx:        context.TODO(),
+				downstream: &okHandler{},
+				client:     &fakeClient{},
+			},
+			method:             "GET",
+			headerKey:          "Authorization",
+			headerValue:        "Bearer good",
+			expectedStatusCode: http.StatusOK,
+			expectedBody:       "ok",
+		},
+		{
+			name: "empty bearer token",
+			handler: &authHandler{
+				ctx:        context.TODO(),
+				downstream: &okHandler{},
+				client:     &fakeClient{},
+			},
+			method:             "GET",
+			headerKey:          "Authorization",
+			headerValue:        "Bearer ",
+			expectedStatusCode: 401,
+			expectedBody:       "empty Bearer token\n",
+		},
+		{
+			name: "authenticated",
+			handler: &authHandler{
+				ctx:        context.TODO(),
+				downstream: &okHandler{},
+				client:     &fakeClient{},
+			},
+			method:             "GET",
+			headerKey:          "Authorization",
+			headerValue:        "Bearer authenticated",
+			expectedStatusCode: 401,
+			expectedBody:       "failed to authorize\n",
+		},
+		{
+			name: "bad",
+			handler: &authHandler{
+				ctx:        context.TODO(),
+				downstream: &okHandler{},
+				client:     &fakeClient{},
+			},
+			method:             "GET",
+			headerKey:          "Authorization",
+			headerValue:        "Bearer bad",
+			expectedStatusCode: 401,
+			expectedBody:       "failed to authorize\n",
+		},
+		{
+			name: "failed to get the Authorization header",
+			handler: &authHandler{
+				ctx:        context.TODO(),
+				downstream: &okHandler{},
+				client:     &fakeClient{},
+			},
+			method:             "GET",
+			expectedStatusCode: 401,
+			expectedBody:       "failed to get the Authorization header\n",
+		},
+		{
+			name: "failed to get the Bearer token",
+			handler: &authHandler{
+				ctx:        context.TODO(),
+				downstream: &okHandler{},
+				client:     &fakeClient{},
+			},
+			method:             "GET",
+			headerKey:          "Authorization",
+			headerValue:        "xxx bad",
+			expectedStatusCode: 401,
+			expectedBody:       "failed to get the Bearer token\n",
+		},
+		{
+			name: "error",
+			handler: &authHandler{
+				ctx:        context.TODO(),
+				downstream: &okHandler{},
+				client:     &fakeClient{},
+			},
+			method:             "GET",
+			headerKey:          "Authorization",
+			headerValue:        "Bearer error",
+			expectedStatusCode: 500,
+			expectedBody:       "failed to authorize due to an internal error\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+
+			req, err := http.NewRequest(tt.method, "url-not-important", tt.body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set(tt.headerKey, tt.headerValue)
+
+			tt.handler.ServeHTTP(rr, req)
+			if diff := cmp.Diff(tt.expectedStatusCode, rr.Code); diff != "" {
+				t.Errorf("%s: status differs from expected:\n%s", tt.name, diff)
+			}
+
+			if diff := cmp.Diff(tt.expectedBody, rr.Body.String()); diff != "" {
+				t.Errorf("%s: body differs from expected:\n%s", tt.name, diff)
+			}
+		})
+	}
 }

@@ -23,11 +23,11 @@ import (
 	"github.com/openshift/cluster-version-operator/lib/resourcedelete"
 	"github.com/openshift/cluster-version-operator/lib/resourcemerge"
 	"github.com/openshift/cluster-version-operator/pkg/internal"
+	"github.com/openshift/cluster-version-operator/pkg/payload/precondition/clusterversion"
 )
 
 const (
-	adminAckGateFmt             string = "^ack-[4-5][.]([0-9]{1,})-[^-]"
-	upgradeableAdminAckRequired        = configv1.ClusterStatusConditionType("UpgradeableAdminAckRequired")
+	adminAckGateFmt string = "^ack-[4-5][.]([0-9]{1,})-[^-]"
 )
 
 var adminAckGateRegexp = regexp.MustCompile(adminAckGateFmt)
@@ -61,8 +61,8 @@ func defaultUpgradeableCheckIntervals() upgradeableCheckIntervals {
 
 // syncUpgradeable synchronizes the upgradeable status only if the sufficient time passed since its last update. This
 // throttling period is dynamic and is driven by upgradeableCheckIntervals.
-func (optr *Operator) syncUpgradeable(cv *configv1.ClusterVersion) error {
-	if u := optr.getUpgradeable(); u != nil {
+func (optr *Operator) syncUpgradeable(cv *configv1.ClusterVersion, ignoreThrottlePeriod bool) error {
+	if u := optr.getUpgradeable(); u != nil && !ignoreThrottlePeriod {
 		throttleFor := optr.upgradeableCheckIntervals.throttlePeriod(cv)
 		if earliestNext := u.At.Add(throttleFor); time.Now().Before(earliestNext) {
 			klog.V(2).Infof("Upgradeability last checked %s ago, will not re-check until %s", time.Since(u.At), earliestNext.Format(time.RFC3339))
@@ -176,7 +176,7 @@ func (optr *Operator) getUpgradeable() *upgradeable {
 }
 
 type upgradeableCheck interface {
-	// returns a not-nil condition when the check fails.
+	// Check returns a not-nil condition that should be addressed before a minor level upgrade when the check fails.
 	Check() *configv1.ClusterOperatorStatusCondition
 }
 
@@ -186,7 +186,7 @@ type clusterOperatorsUpgradeable struct {
 
 func (check *clusterOperatorsUpgradeable) Check() *configv1.ClusterOperatorStatusCondition {
 	cond := &configv1.ClusterOperatorStatusCondition{
-		Type:   configv1.ClusterStatusConditionType("UpgradeableClusterOperators"),
+		Type:   internal.UpgradeableClusterOperators,
 		Status: configv1.ConditionFalse,
 	}
 	ops, err := check.coLister.List(labels.Everything())
@@ -238,7 +238,7 @@ type clusterVersionOverridesUpgradeable struct {
 
 func (check *clusterVersionOverridesUpgradeable) Check() *configv1.ClusterOperatorStatusCondition {
 	cond := &configv1.ClusterOperatorStatusCondition{
-		Type:   configv1.ClusterStatusConditionType("UpgradeableClusterVersionOverrides"),
+		Type:   internal.UpgradeableClusterVersionOverrides,
 		Status: configv1.ConditionFalse,
 	}
 
@@ -262,12 +262,40 @@ func (check *clusterVersionOverridesUpgradeable) Check() *configv1.ClusterOperat
 	return cond
 }
 
+type upgradeInProgressUpgradeable struct {
+	name     string
+	cvLister configlistersv1.ClusterVersionLister
+}
+
+func (check *upgradeInProgressUpgradeable) Check() *configv1.ClusterOperatorStatusCondition {
+	cond := &configv1.ClusterOperatorStatusCondition{
+		Type:   internal.UpgradeableUpgradeInProgress,
+		Status: configv1.ConditionTrue,
+	}
+
+	cv, err := check.cvLister.Get(check.name)
+	if meta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+		return nil
+	} else if err != nil {
+		klog.Error(err)
+		return nil
+	}
+
+	if progressingCondition := resourcemerge.FindOperatorStatusCondition(cv.Status.Conditions, configv1.OperatorProgressing); progressingCondition != nil &&
+		progressingCondition.Status == configv1.ConditionTrue {
+		cond.Reason = "UpdateInProgress"
+		cond.Message = fmt.Sprintf("An update is already in progress and the details are in the %s condition", configv1.OperatorProgressing)
+		return cond
+	}
+	return nil
+}
+
 type clusterManifestDeleteInProgressUpgradeable struct {
 }
 
 func (check *clusterManifestDeleteInProgressUpgradeable) Check() *configv1.ClusterOperatorStatusCondition {
 	cond := &configv1.ClusterOperatorStatusCondition{
-		Type:   configv1.ClusterStatusConditionType("UpgradeableDeletesInProgress"),
+		Type:   internal.UpgradeableDeletesInProgress,
 		Status: configv1.ConditionFalse,
 	}
 	if deletes := resourcedelete.DeletesInProgress(); len(deletes) > 0 {
@@ -331,13 +359,13 @@ func (check *clusterAdminAcksCompletedUpgradeable) Check() *configv1.ClusterOper
 		message := fmt.Sprintf("Unable to get ClusterVersion, err=%v.", err)
 		klog.Error(message)
 		return &configv1.ClusterOperatorStatusCondition{
-			Type:    upgradeableAdminAckRequired,
+			Type:    internal.UpgradeableAdminAckRequired,
 			Status:  configv1.ConditionFalse,
 			Reason:  "UnableToGetClusterVersion",
 			Message: message,
 		}
 	}
-	currentVersion := getCurrentVersion(cv.Status.History)
+	currentVersion := clusterversion.GetCurrentVersion(cv.Status.History)
 
 	// This can occur in early start up when the configmap is first added and version history
 	// has not yet been populated.
@@ -355,7 +383,7 @@ func (check *clusterAdminAcksCompletedUpgradeable) Check() *configv1.ClusterOper
 		}
 		klog.Error(message)
 		return &configv1.ClusterOperatorStatusCondition{
-			Type:    upgradeableAdminAckRequired,
+			Type:    internal.UpgradeableAdminAckRequired,
 			Status:  configv1.ConditionFalse,
 			Reason:  "UnableToAccessAdminGatesConfigMap",
 			Message: message,
@@ -371,7 +399,7 @@ func (check *clusterAdminAcksCompletedUpgradeable) Check() *configv1.ClusterOper
 		}
 		klog.Error(message)
 		return &configv1.ClusterOperatorStatusCondition{
-			Type:    upgradeableAdminAckRequired,
+			Type:    internal.UpgradeableAdminAckRequired,
 			Status:  configv1.ConditionFalse,
 			Reason:  "UnableToAccessAdminAcksConfigMap",
 			Message: message,
@@ -392,7 +420,7 @@ func (check *clusterAdminAcksCompletedUpgradeable) Check() *configv1.ClusterOper
 	}
 	if len(reasons) == 1 {
 		return &configv1.ClusterOperatorStatusCondition{
-			Type:    upgradeableAdminAckRequired,
+			Type:    internal.UpgradeableAdminAckRequired,
 			Status:  configv1.ConditionFalse,
 			Reason:  reason,
 			Message: messages[0],
@@ -400,7 +428,7 @@ func (check *clusterAdminAcksCompletedUpgradeable) Check() *configv1.ClusterOper
 	} else if len(reasons) > 1 {
 		sort.Strings(messages)
 		return &configv1.ClusterOperatorStatusCondition{
-			Type:    upgradeableAdminAckRequired,
+			Type:    internal.UpgradeableAdminAckRequired,
 			Status:  configv1.ConditionFalse,
 			Reason:  "MultipleReasons",
 			Message: strings.Join(messages, " "),
@@ -420,6 +448,7 @@ func (optr *Operator) defaultUpgradeableChecks() []upgradeableCheck {
 		},
 		&clusterOperatorsUpgradeable{coLister: optr.coLister},
 		&clusterManifestDeleteInProgressUpgradeable{},
+		&upgradeInProgressUpgradeable{name: optr.name, cvLister: optr.cvLister},
 	}
 }
 
@@ -501,7 +530,7 @@ func (optr *Operator) adminGatesEventHandler() cache.ResourceEventHandler {
 //
 // The cv parameter is expected to be non-nil.
 func (intervals *upgradeableCheckIntervals) throttlePeriod(cv *configv1.ClusterVersion) time.Duration {
-	if cond := resourcemerge.FindOperatorStatusCondition(cv.Status.Conditions, DesiredReleaseAccepted); cond != nil {
+	if cond := resourcemerge.FindOperatorStatusCondition(cv.Status.Conditions, internal.ReleaseAccepted); cond != nil {
 		deadline := cond.LastTransitionTime.Time.Add(intervals.afterPreconditionsFailed)
 		if cond.Reason == "PreconditionChecks" && cond.Status == configv1.ConditionFalse && time.Now().Before(deadline) {
 			return intervals.minOnFailedPreconditions

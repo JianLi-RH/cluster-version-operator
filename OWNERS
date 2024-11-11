@@ -2,15 +2,17 @@
 
 approvers:
   - wking
-  - petr-muller
   - DavidHurta
   - PratikMahajan
+  - hongkailiu
+  - fao89
 reviewers:
   - wking
-  - petr-muller
   - DavidHurta
   - hongkailiu
+  - fao89
 emeritus_approvers:
+  - petr-muller
   - smarterclayton
   - abhinavdahiya
   - LalatenduMohanty

@@ -5,6 +5,16 @@ import (
 	"github.com/openshift/api/features"
 )
 
+// StubOpenShiftVersion is the default OpenShift version placeholder for the purpose of determining
+// enabled and disabled CVO feature gates. It is assumed to never conflict with a real OpenShift
+// version. Both DefaultCvoGates and CvoGatesFromFeatureGate should return a safe conservative
+// default set of enabled and disabled gates when StubOpenShiftVersion is passed as the version.
+// This value is an analogue to the "0.0.1-snapshot" string that is used as a placeholder in
+// second-level operator manifests. Here we use the same string for consistency, but the constant
+// should be only used by the callers of CvoGatesFromFeatureGate and DefaultCvoGates methods when
+// the caller does not know its actual OpenShift version.
+const StubOpenShiftVersion = "0.0.1-snapshot"
+
 // CvoGateChecker allows CVO code to check which feature gates are enabled
 type CvoGateChecker interface {
 	// UnknownVersion flag is set to true if CVO did not find a matching version in the FeatureGate
@@ -18,33 +28,13 @@ type CvoGateChecker interface {
 	// to restart when the flags change.
 	UnknownVersion() bool
 
-	// ReconciliationIssuesCondition controls whether CVO maintains a Condition with
-	// ReconciliationIssues type, containing a JSON that describes all "issues" that prevented
-	// or delayed CVO from reconciling individual resources in the cluster. This is a pseudo-API
-	// that the experimental work for "oc adm upgrade status" uses to report upgrade status, and
-	// should never be relied upon by any production code. We may want to eventually turn this into
-	// some kind of "real" API.
-	ReconciliationIssuesCondition() bool
-}
+	// StatusReleaseArchitecture controls whether CVO populates
+	// Release.Architecture in status properties like status.desired and status.history[].
+	StatusReleaseArchitecture() bool
 
-type panicOnUsageBeforeInitializationFunc func()
-
-func panicOnUsageBeforeInitialization() {
-	panic("CVO feature flags were used before they were initialized")
-}
-
-// PanicOnUsageBeforeInitialization is a CvoGateChecker that panics if any of its methods are called. This checker should
-// be used before CVO feature gates are actually known and some code tries to check them.
-var PanicOnUsageBeforeInitialization = panicOnUsageBeforeInitializationFunc(panicOnUsageBeforeInitialization)
-
-func (p panicOnUsageBeforeInitializationFunc) ReconciliationIssuesCondition() bool {
-	p()
-	return false
-}
-
-func (p panicOnUsageBeforeInitializationFunc) UnknownVersion() bool {
-	p()
-	return false
+	// CVOConfiguration controls whether the CVO reconciles the ClusterVersionOperator resource that corresponds
+	// to its configuration.
+	CVOConfiguration() bool
 }
 
 // CvoGates contains flags that control CVO functionality gated by product feature gates. The
@@ -56,24 +46,30 @@ type CvoGates struct {
 	desiredVersion string
 
 	// individual flags mirror the CvoGateChecker interface
-	unknownVersion                bool
-	reconciliationIssuesCondition bool
+	unknownVersion            bool
+	statusReleaseArchitecture bool
+	cvoConfiguration          bool
 }
 
-func (c CvoGates) ReconciliationIssuesCondition() bool {
-	return c.reconciliationIssuesCondition
+func (c CvoGates) StatusReleaseArchitecture() bool {
+	return c.statusReleaseArchitecture
 }
 
 func (c CvoGates) UnknownVersion() bool {
 	return c.unknownVersion
 }
 
+func (c CvoGates) CVOConfiguration() bool {
+	return c.cvoConfiguration
+}
+
 // DefaultCvoGates apply when actual features for given version are unknown
 func DefaultCvoGates(version string) CvoGates {
 	return CvoGates{
-		desiredVersion:                version,
-		unknownVersion:                true,
-		reconciliationIssuesCondition: false,
+		desiredVersion:            version,
+		unknownVersion:            true,
+		statusReleaseArchitecture: false,
+		cvoConfiguration:          false,
 	}
 }
 
@@ -90,13 +86,19 @@ func CvoGatesFromFeatureGate(gate *configv1.FeatureGate, version string) CvoGate
 		// We found the matching version, so we do not need to run in the unknown version mode
 		enabledGates.unknownVersion = false
 		for _, enabled := range g.Enabled {
-			if enabled.Name == features.FeatureGateUpgradeStatus {
-				enabledGates.reconciliationIssuesCondition = true
+			switch enabled.Name {
+			case features.FeatureGateImageStreamImportMode:
+				enabledGates.statusReleaseArchitecture = true
+			case features.FeatureGateCVOConfiguration:
+				enabledGates.cvoConfiguration = true
 			}
 		}
 		for _, disabled := range g.Disabled {
-			if disabled.Name == features.FeatureGateUpgradeStatus {
-				enabledGates.reconciliationIssuesCondition = false
+			switch disabled.Name {
+			case features.FeatureGateImageStreamImportMode:
+				enabledGates.statusReleaseArchitecture = false
+			case features.FeatureGateCVOConfiguration:
+				enabledGates.cvoConfiguration = false
 			}
 		}
 	}

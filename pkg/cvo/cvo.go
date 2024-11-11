@@ -31,18 +31,20 @@ import (
 	clientset "github.com/openshift/client-go/config/clientset/versioned"
 	configinformersv1 "github.com/openshift/client-go/config/informers/externalversions/config/v1"
 	configlistersv1 "github.com/openshift/client-go/config/listers/config/v1"
+	operatorclientset "github.com/openshift/client-go/operator/clientset/versioned"
+	operatorexternalversions "github.com/openshift/client-go/operator/informers/externalversions"
 	"github.com/openshift/library-go/pkg/manifest"
 	"github.com/openshift/library-go/pkg/verify"
 	"github.com/openshift/library-go/pkg/verify/store"
 	"github.com/openshift/library-go/pkg/verify/store/configmap"
 	"github.com/openshift/library-go/pkg/verify/store/sigstore"
 
-	"github.com/openshift/cluster-version-operator/lib/capability"
 	"github.com/openshift/cluster-version-operator/lib/resourcebuilder"
 	"github.com/openshift/cluster-version-operator/lib/validation"
 	"github.com/openshift/cluster-version-operator/pkg/clusterconditions"
 	"github.com/openshift/cluster-version-operator/pkg/clusterconditions/standard"
 	"github.com/openshift/cluster-version-operator/pkg/customsignaturestore"
+	"github.com/openshift/cluster-version-operator/pkg/cvo/configuration"
 	cvointernal "github.com/openshift/cluster-version-operator/pkg/cvo/internal"
 	"github.com/openshift/cluster-version-operator/pkg/cvo/internal/dynamicclient"
 	"github.com/openshift/cluster-version-operator/pkg/featuregates"
@@ -93,9 +95,10 @@ type Operator struct {
 	// releaseCreated, if set, is the timestamp of the current update.
 	releaseCreated time.Time
 
-	client        clientset.Interface
-	kubeClient    kubernetes.Interface
-	eventRecorder record.EventRecorder
+	client         clientset.Interface
+	kubeClient     kubernetes.Interface
+	operatorClient operatorclientset.Interface
+	eventRecorder  record.EventRecorder
 
 	// minimumUpdateCheckInterval is the minimum duration to check for updates from
 	// the update service.
@@ -120,11 +123,11 @@ type Operator struct {
 	cacheSynced           []cache.InformerSynced
 
 	// queue tracks applying updates to a cluster.
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[any]
 	// availableUpdatesQueue tracks checking for updates from the update server.
-	availableUpdatesQueue workqueue.RateLimitingInterface
+	availableUpdatesQueue workqueue.TypedRateLimitingInterface[any]
 	// upgradeableQueue tracks checking for upgradeable.
-	upgradeableQueue workqueue.RateLimitingInterface
+	upgradeableQueue workqueue.TypedRateLimitingInterface[any]
 
 	// statusLock guards access to modifying available updates
 	statusLock       sync.Mutex
@@ -141,6 +144,9 @@ type Operator struct {
 
 	// conditionRegistry is used to evaluate whether a particular condition is risky or not.
 	conditionRegistry clusterconditions.ConditionRegistry
+
+	// hypershift signals whether the CVO is running inside a hosted control plane.
+	hypershift bool
 
 	// injectClusterIdIntoPromQL indicates whether the CVO should inject the cluster id
 	// into PromQL queries while evaluating risks from conditional updates. This is needed
@@ -168,6 +174,19 @@ type Operator struct {
 	// via annotation
 	exclude string
 
+	// requiredFeatureSet is the feature set that was detected in the cluster when CVO was started and is used
+	// to select the manifests that will be applied in the cluster. The starting value cannot be changed in the executing
+	// CVO but the featurechangestopper controller will detect a feature set change in the cluster and shutdown the CVO.
+	// Enforcing featuresets is a standard GA CVO behavior that supports the feature gating functionality across the whole
+	// cluster, as opposed to the enabledFeatureGates which controls what gated behaviors of CVO itself are enabled by
+	// the cluster feature gates.
+	// See: https://github.com/openshift/enhancements/blob/master/enhancements/update/cvo-techpreview-manifests.md
+	requiredFeatureSet configv1.FeatureSet
+
+	// enabledFeatureGates is the checker for what gated CVO behaviors are enabled or disabled by specific cluster-level
+	// feature gates. It allows multiplexing the cluster-level feature gates to more granular CVO-level gates. Similarly
+	// to the requiredFeatureSet, the enabledFeatureGates cannot be changed in the executing CVO but the
+	// featurechangestopper controller will detect when cluster feature gate config changes and shutdown the CVO.
 	enabledFeatureGates featuregates.CvoGateChecker
 
 	clusterProfile string
@@ -176,6 +195,9 @@ type Operator struct {
 	// alwaysEnableCapabilities is a list of the cluster capabilities which should
 	// always be implicitly enabled.
 	alwaysEnableCapabilities []configv1.ClusterVersionCapability
+
+	// configuration, if enabled, reconciles the ClusterVersionOperator configuration.
+	configuration *configuration.ClusterVersionOperatorConfiguration
 }
 
 // New returns a new cluster version operator.
@@ -190,14 +212,19 @@ func New(
 	cmConfigInformer informerscorev1.ConfigMapInformer,
 	cmConfigManagedInformer informerscorev1.ConfigMapInformer,
 	proxyInformer configinformersv1.ProxyInformer,
+	operatorInformerFactory operatorexternalversions.SharedInformerFactory,
 	client clientset.Interface,
 	kubeClient kubernetes.Interface,
+	operatorClient operatorclientset.Interface,
 	exclude string,
 	clusterProfile string,
+	hypershift bool,
 	promqlTarget clusterconditions.PromQLTarget,
 	injectClusterIdIntoPromQL bool,
 	updateService string,
 	alwaysEnableCapabilities []configv1.ClusterVersionCapability,
+	featureSet configv1.FeatureSet,
+	cvoGates featuregates.CvoGateChecker,
 ) (*Operator, error) {
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(klog.Infof)
@@ -217,23 +244,23 @@ func New(
 		payloadDir:                 overridePayloadDir,
 		updateService:              updateService,
 
-		client:        client,
-		kubeClient:    kubeClient,
-		eventRecorder: eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: namespace}),
+		client:                client,
+		kubeClient:            kubeClient,
+		operatorClient:        operatorClient,
+		eventRecorder:         eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: namespace}),
+		queue:                 workqueue.NewTypedRateLimitingQueueWithConfig[any](workqueue.DefaultTypedControllerRateLimiter[any](), workqueue.TypedRateLimitingQueueConfig[any]{Name: "clusterversion"}),
+		availableUpdatesQueue: workqueue.NewTypedRateLimitingQueueWithConfig[any](workqueue.DefaultTypedControllerRateLimiter[any](), workqueue.TypedRateLimitingQueueConfig[any]{Name: "availableupdates"}),
+		upgradeableQueue:      workqueue.NewTypedRateLimitingQueueWithConfig[any](workqueue.DefaultTypedControllerRateLimiter[any](), workqueue.TypedRateLimitingQueueConfig[any]{Name: "upgradeable"}),
 
-		queue:                 workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "clusterversion"),
-		availableUpdatesQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "availableupdates"),
-		upgradeableQueue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "upgradeable"),
-
+		hypershift:                hypershift,
 		exclude:                   exclude,
 		clusterProfile:            clusterProfile,
 		conditionRegistry:         standard.NewConditionRegistry(promqlTarget),
 		injectClusterIdIntoPromQL: injectClusterIdIntoPromQL,
 
-		// Because of OCPBUGS-30080, we can only detect the enabled feature gates after Operator loads the initial payload
-		// from disk via LoadInitialPayload. We must not have any gate-checking code until that happens, so we initialize
-		// this field with a checker that panics when used.
-		enabledFeatureGates:      featuregates.PanicOnUsageBeforeInitialization,
+		requiredFeatureSet:  featureSet,
+		enabledFeatureGates: cvoGates,
+
 		alwaysEnableCapabilities: alwaysEnableCapabilities,
 	}
 
@@ -263,12 +290,14 @@ func New(
 	// make sure this is initialized after all the listers are initialized
 	optr.upgradeableChecks = optr.defaultUpgradeableChecks()
 
+	optr.configuration = configuration.NewClusterVersionOperatorConfiguration(operatorClient, operatorInformerFactory)
+
 	return optr, nil
 }
 
 // LoadInitialPayload waits until a ClusterVersion object exists. It then retrieves the payload contents, verifies the
 // initial state and returns it. If the payload is invalid, an error is returned.
-func (optr *Operator) LoadInitialPayload(ctx context.Context, startingRequiredFeatureSet configv1.FeatureSet, restConfig *rest.Config) (*payload.Update, error) {
+func (optr *Operator) LoadInitialPayload(ctx context.Context, restConfig *rest.Config) (*payload.Update, error) {
 
 	// wait until cluster version object exists
 	if err := wait.PollUntilContextCancel(ctx, 3*time.Second, true, func(ctx context.Context) (bool, error) {
@@ -288,8 +317,8 @@ func (optr *Operator) LoadInitialPayload(ctx context.Context, startingRequiredFe
 		return nil, fmt.Errorf("Error when attempting to get cluster version object: %w", err)
 	}
 
-	update, err := payload.LoadUpdate(optr.defaultPayloadDir(), optr.release.Image, optr.exclude, string(startingRequiredFeatureSet),
-		optr.clusterProfile, capability.GetKnownCapabilities())
+	update, err := payload.LoadUpdate(optr.defaultPayloadDir(), optr.release.Image, optr.exclude, string(optr.requiredFeatureSet),
+		optr.clusterProfile, configv1.KnownClusterVersionCapabilities)
 
 	if err != nil {
 		return nil, fmt.Errorf("the local release contents are invalid - no current version can be determined from disk: %v", err)
@@ -324,11 +353,14 @@ func (optr *Operator) LoadInitialPayload(ctx context.Context, startingRequiredFe
 
 // InitializeFromPayload configures the controller that loads and applies content to the cluster given an initial payload
 // and feature gate data.
-func (optr *Operator) InitializeFromPayload(update *payload.Update, requiredFeatureSet configv1.FeatureSet, cvoFlags featuregates.CvoGateChecker, restConfig *rest.Config, burstRestConfig *rest.Config) {
-	optr.enabledFeatureGates = cvoFlags
+func (optr *Operator) InitializeFromPayload(ctx context.Context, restConfig *rest.Config, burstRestConfig *rest.Config) error {
+	update, err := optr.LoadInitialPayload(ctx, restConfig)
+	if err != nil {
+		return err
+	}
+
 	optr.release = update.Release
 	optr.releaseCreated = update.ImageRef.CreationTimestamp.Time
-	optr.SetArchitecture(update.Architecture)
 
 	// after the verifier has been loaded, initialize the sync worker with a payload retriever
 	// which will consume the verifier
@@ -344,11 +376,13 @@ func (optr *Operator) InitializeFromPayload(update *payload.Update, requiredFeat
 			Cap:      time.Second * 15,
 		},
 		optr.exclude,
-		requiredFeatureSet,
+		optr.requiredFeatureSet,
 		optr.eventRecorder,
 		optr.clusterProfile,
 		optr.alwaysEnableCapabilities,
 	)
+
+	return nil
 }
 
 // ownerReferenceModifier sets the owner reference to the current CV resource if no other reference exists. It also resets
@@ -410,6 +444,7 @@ func (optr *Operator) Run(runContext context.Context, shutdownContext context.Co
 	defer optr.queue.ShutDown()
 	defer optr.availableUpdatesQueue.ShutDown()
 	defer optr.upgradeableQueue.ShutDown()
+	defer optr.configuration.Queue().ShutDown()
 	stopCh := runContext.Done()
 
 	klog.Infof("Starting ClusterVersionOperator with minimum reconcile period %s", optr.minimumUpdateCheckInterval)
@@ -448,10 +483,29 @@ func (optr *Operator) Run(runContext context.Context, shutdownContext context.Co
 		resultChannel <- asyncResult{name: "available updates"}
 	}()
 
+	if optr.shouldReconcileCVOConfiguration() {
+		resultChannelCount++
+		go func() {
+			defer utilruntime.HandleCrash()
+			if err := optr.configuration.Start(runContext); err != nil {
+				utilruntime.HandleError(fmt.Errorf("unable to initialize the CVO configuration sync: %v", err))
+			} else {
+				wait.UntilWithContext(runContext, func(runContext context.Context) {
+					optr.worker(runContext, optr.configuration.Queue(), optr.configuration.Sync)
+				}, time.Second)
+			}
+			resultChannel <- asyncResult{name: "cvo configuration"}
+		}()
+	} else {
+		klog.Infof("The ClusterVersionOperatorConfiguration feature gate is disabled or HyperShift is detected; the configuration sync routine will not run.")
+	}
+
 	resultChannelCount++
 	go func() {
 		defer utilruntime.HandleCrash()
-		wait.UntilWithContext(runContext, func(runContext context.Context) { optr.worker(runContext, optr.upgradeableQueue, optr.upgradeableSync) }, time.Second)
+		wait.UntilWithContext(runContext, func(runContext context.Context) {
+			optr.worker(runContext, optr.upgradeableQueue, optr.upgradeableSyncFunc(false))
+		}, time.Second)
 		resultChannel <- asyncResult{name: "upgradeable"}
 	}()
 
@@ -461,6 +515,10 @@ func (optr *Operator) Run(runContext context.Context, shutdownContext context.Co
 		wait.UntilWithContext(runContext, func(runContext context.Context) {
 			// run the worker, then when the queue is closed sync one final time to flush any pending status
 			optr.worker(runContext, optr.queue, func(runContext context.Context, key string) error { return optr.sync(runContext, key) })
+			// This is to ensure upgradeableCondition to be synced and thus to avoid the race caused by the throttle
+			if err := optr.upgradeableSyncFunc(true)(shutdownContext, optr.queueKey()); err != nil {
+				utilruntime.HandleError(fmt.Errorf("unable to perform final upgradeable sync: %v", err))
+			}
 			if err := optr.sync(shutdownContext, optr.queueKey()); err != nil {
 				utilruntime.HandleError(fmt.Errorf("unable to perform final sync: %v", err))
 			}
@@ -511,6 +569,7 @@ func (optr *Operator) Run(runContext context.Context, shutdownContext context.Co
 			optr.queue.ShutDown()
 			optr.availableUpdatesQueue.ShutDown()
 			optr.upgradeableQueue.ShutDown()
+			optr.configuration.Queue().ShutDown()
 		}
 	}
 
@@ -607,14 +666,14 @@ func clusterOperatorConditionStatus(co *configv1.ClusterOperator, condType confi
 	return configv1.ConditionUnknown
 }
 
-func (optr *Operator) worker(ctx context.Context, queue workqueue.RateLimitingInterface, syncHandler func(context.Context, string) error) {
+func (optr *Operator) worker(ctx context.Context, queue workqueue.TypedRateLimitingInterface[any], syncHandler func(context.Context, string) error) {
 	for processNextWorkItem(ctx, queue, syncHandler, optr.syncFailingStatus) {
 	}
 }
 
 type syncFailingStatusFunc func(ctx context.Context, config *configv1.ClusterVersion, err error) error
 
-func processNextWorkItem(ctx context.Context, queue workqueue.RateLimitingInterface, syncHandler func(context.Context, string) error, syncFailingStatus syncFailingStatusFunc) bool {
+func processNextWorkItem(ctx context.Context, queue workqueue.TypedRateLimitingInterface[any], syncHandler func(context.Context, string) error, syncFailingStatus syncFailingStatusFunc) bool {
 	key, quit := queue.Get()
 	if quit {
 		return false
@@ -626,7 +685,7 @@ func processNextWorkItem(ctx context.Context, queue workqueue.RateLimitingInterf
 	return true
 }
 
-func handleErr(ctx context.Context, queue workqueue.RateLimitingInterface, err error, key interface{}, syncFailingStatus syncFailingStatusFunc) {
+func handleErr(ctx context.Context, queue workqueue.TypedRateLimitingInterface[any], err error, key interface{}, syncFailingStatus syncFailingStatusFunc) {
 	if err == nil {
 		queue.Forget(key)
 		return
@@ -677,7 +736,7 @@ func (optr *Operator) sync(ctx context.Context, key string) error {
 	config := validation.ClearInvalidFields(original, errs)
 
 	// identify the desired next version
-	desired, found := findUpdateFromConfig(config, optr.getArchitecture())
+	desired, found := findUpdateFromConfig(config, optr.release.Architecture)
 	initialized := optr.configSync.Initialized()
 	if found && initialized {
 		klog.V(2).Infof("Desired version from spec is %#v after initialization", desired)
@@ -722,8 +781,6 @@ func (optr *Operator) sync(ctx context.Context, key string) error {
 	// inform the config sync loop about our desired state
 	status := optr.configSync.Update(ctx, config.Generation, desired, config, state)
 
-	optr.SetArchitecture(status.Architecture)
-
 	// write cluster version status
 	return optr.syncStatus(ctx, original, config, status, errs)
 }
@@ -747,27 +804,29 @@ func (optr *Operator) availableUpdatesSync(ctx context.Context, key string) erro
 	return optr.syncAvailableUpdates(ctx, config)
 }
 
-// upgradeableSync is triggered on cluster version change (and periodic requeues) to
+// upgradeableSyncFunc returns a function that is triggered on cluster version change (and periodic requeues) to
 // sync upgradeableCondition. It only modifies cluster version.
-func (optr *Operator) upgradeableSync(_ context.Context, key string) error {
-	startTime := time.Now()
-	klog.V(2).Infof("Started syncing upgradeable %q", key)
-	defer func() {
-		klog.V(2).Infof("Finished syncing upgradeable %q (%v)", key, time.Since(startTime))
-	}()
+func (optr *Operator) upgradeableSyncFunc(ignoreThrottlePeriod bool) func(_ context.Context, key string) error {
+	return func(_ context.Context, key string) error {
+		startTime := time.Now()
+		klog.V(2).Infof("Started syncing upgradeable %q", key)
+		defer func() {
+			klog.V(2).Infof("Finished syncing upgradeable %q (%v)", key, time.Since(startTime))
+		}()
 
-	config, err := optr.cvLister.Get(optr.name)
-	if apierrors.IsNotFound(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if errs := validation.ValidateClusterVersion(config); len(errs) > 0 {
-		return nil
-	}
+		config, err := optr.cvLister.Get(optr.name)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if errs := validation.ValidateClusterVersion(config); len(errs) > 0 {
+			return nil
+		}
 
-	return optr.syncUpgradeable(config)
+		return optr.syncUpgradeable(config, ignoreThrottlePeriod)
+	}
 }
 
 // isOlderThanLastUpdate returns true if the cluster version is older than
@@ -844,7 +903,7 @@ func (optr *Operator) currentVersion() configv1.Release {
 func mergeReleaseMetadata(release configv1.Release, getAvailableUpdates func() *availableUpdates) configv1.Release {
 	merged := *release.DeepCopy()
 
-	if merged.Version == "" || len(merged.URL) == 0 || merged.Channels == nil {
+	if merged.Version == "" || len(merged.URL) == 0 || len(merged.Architecture) == 0 || merged.Channels == nil {
 		// only fill in missing values from availableUpdates, to avoid clobbering data from payload.LoadUpdate.
 		availableUpdates := getAvailableUpdates()
 		if availableUpdates != nil {
@@ -859,12 +918,32 @@ func mergeReleaseMetadata(release configv1.Release, getAvailableUpdates func() *
 					}
 				}
 			}
-			if update != nil {
+			if update == nil {
+				var versionMatch *configv1.Release
+				if availableUpdates.Current.Version == merged.Version {
+					versionMatch = &availableUpdates.Current
+				} else {
+					for i, u := range availableUpdates.Updates {
+						if u.Version == merged.Version {
+							versionMatch = &availableUpdates.Updates[i]
+							break
+						}
+					}
+				}
+				if versionMatch == nil {
+					klog.V(2).Infof("No available update found matching the digest of %q or the version %q", merged.Image, merged.Version)
+				} else {
+					klog.V(2).Infof("No available update found matching the digest of %q, although there was a match for version %q with a different tag or digest %q", merged.Image, merged.Version, versionMatch.Image)
+				}
+			} else {
 				if merged.Version == "" {
 					merged.Version = update.Version
 				}
 				if len(merged.URL) == 0 {
 					merged.URL = update.URL
+				}
+				if len(merged.Architecture) == 0 {
+					merged.Architecture = update.Architecture
 				}
 				if merged.Channels == nil {
 					merged.Channels = append(update.Channels[:0:0], update.Channels...) // copy
@@ -982,6 +1061,7 @@ func hasReachedLevel(cv *configv1.ClusterVersion, desired configv1.Update) bool 
 func (optr *Operator) defaultPreconditionChecks() precondition.List {
 	return []precondition.Precondition{
 		preconditioncv.NewRollback(optr.cvLister),
+		preconditioncv.NewGiantHop(optr.cvLister),
 		preconditioncv.NewUpgradeable(optr.cvLister),
 		preconditioncv.NewRecommendedUpdate(optr.cvLister),
 	}
@@ -1002,4 +1082,12 @@ func (optr *Operator) HTTPClient() (*http.Client, error) {
 	return &http.Client{
 		Transport: transport,
 	}, nil
+}
+
+// shouldReconcileCVOConfiguration returns whether the CVO should reconcile its configuration using the API server.
+//
+// enabledFeatureGates must be initialized before the function is called.
+func (optr *Operator) shouldReconcileCVOConfiguration() bool {
+	// The relevant CRD and CR are not applied in HyperShift, which configures the CVO via a configuration file
+	return optr.enabledFeatureGates.CVOConfiguration() && !optr.hypershift
 }

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -48,15 +49,13 @@ func (optr *Operator) syncAvailableUpdates(ctx context.Context, config *configv1
 
 	channel := config.Spec.Channel
 	desiredArch := optr.getDesiredArchitecture(config.Spec.DesiredUpdate)
-	currentArch := optr.getArchitecture()
-
-	if desiredArch == "" {
-		desiredArch = currentArch
-	}
+	currentArch := optr.getCurrentArchitecture()
 
 	// updates are only checked at most once per minimumUpdateCheckInterval or if the generation changes
 	optrAvailableUpdates := optr.getAvailableUpdates()
 	needFreshFetch := true
+	preserveCacheOnFailure := false
+	maximumCacheInterval := 24 * time.Hour
 	if optrAvailableUpdates == nil {
 		klog.V(2).Info("First attempt to retrieve available updates")
 		optrAvailableUpdates = &availableUpdates{}
@@ -66,14 +65,18 @@ func (optr *Operator) syncAvailableUpdates(ctx context.Context, config *configv1
 		for i := range config.Status.ConditionalUpdates {
 			optrAvailableUpdates.ConditionalUpdates = append(optrAvailableUpdates.ConditionalUpdates, *config.Status.ConditionalUpdates[i].DeepCopy())
 		}
-	} else if !optrAvailableUpdates.RecentlyChanged(optr.minimumUpdateCheckInterval) {
-		klog.V(2).Infof("Retrieving available updates again, because more than %s has elapsed since %s", optr.minimumUpdateCheckInterval, optrAvailableUpdates.LastAttempt.Format(time.RFC3339))
 	} else if channel != optrAvailableUpdates.Channel {
 		klog.V(2).Infof("Retrieving available updates again, because the channel has changed from %q to %q", optrAvailableUpdates.Channel, channel)
 	} else if desiredArch != optrAvailableUpdates.Architecture {
 		klog.V(2).Infof("Retrieving available updates again, because the architecture has changed from %q to %q", optrAvailableUpdates.Architecture, desiredArch)
+	} else if !optrAvailableUpdates.RecentlyChanged(maximumCacheInterval) {
+		klog.V(2).Infof("Retrieving available updates again, because more than %s has elapsed since last change at %s.  Will clear the cache if this fails.", maximumCacheInterval, optrAvailableUpdates.LastAttempt.Format(time.RFC3339))
+	} else if !optrAvailableUpdates.RecentlyAttempted(optr.minimumUpdateCheckInterval) {
+		klog.V(2).Infof("Retrieving available updates again, because more than %s has elapsed since last attempt at %s", optr.minimumUpdateCheckInterval, optrAvailableUpdates.LastAttempt.Format(time.RFC3339))
+		preserveCacheOnFailure = true
 	} else if updateService == optrAvailableUpdates.UpdateService || (updateService == defaultUpdateService && optrAvailableUpdates.UpdateService == "") {
 		needsConditionalUpdateEval := false
+		preserveCacheOnFailure = true
 		for _, conditionalUpdate := range optrAvailableUpdates.ConditionalUpdates {
 			if recommended := findRecommendedCondition(conditionalUpdate.Conditions); recommended == nil {
 				needsConditionalUpdateEval = true
@@ -126,11 +129,19 @@ func (optr *Operator) syncAvailableUpdates(ctx context.Context, config *configv1
 		optrAvailableUpdates.UpdateService = updateService
 		optrAvailableUpdates.Channel = channel
 		optrAvailableUpdates.Architecture = desiredArch
-		optrAvailableUpdates.Current = current
-		optrAvailableUpdates.Updates = updates
-		optrAvailableUpdates.ConditionalUpdates = conditionalUpdates
 		optrAvailableUpdates.ConditionRegistry = optr.conditionRegistry
 		optrAvailableUpdates.Condition = condition
+
+		responseFailed := (condition.Type == configv1.RetrievedUpdates &&
+			condition.Status == configv1.ConditionFalse &&
+			(condition.Reason == "RemoteFailed" ||
+				condition.Reason == "ResponseFailed" ||
+				condition.Reason == "ResponseInvalid"))
+		if !responseFailed || (responseFailed && !preserveCacheOnFailure) {
+			optrAvailableUpdates.Current = current
+			optrAvailableUpdates.Updates = updates
+			optrAvailableUpdates.ConditionalUpdates = conditionalUpdates
+		}
 	}
 
 	optrAvailableUpdates.evaluateConditionalUpdates(ctx)
@@ -183,11 +194,15 @@ type availableUpdates struct {
 	Condition configv1.ClusterOperatorStatusCondition
 }
 
-func (u *availableUpdates) RecentlyChanged(interval time.Duration) bool {
+func (u *availableUpdates) RecentlyAttempted(interval time.Duration) bool {
 	return u.LastAttempt.After(time.Now().Add(-interval))
 }
 
-func (u *availableUpdates) NeedsUpdate(original *configv1.ClusterVersion) *configv1.ClusterVersion {
+func (u *availableUpdates) RecentlyChanged(interval time.Duration) bool {
+	return u.LastSyncOrConfigChange.After(time.Now().Add(-interval))
+}
+
+func (u *availableUpdates) NeedsUpdate(original *configv1.ClusterVersion, statusReleaseArchitecture bool) *configv1.ClusterVersion {
 	if u == nil {
 		return nil
 	}
@@ -195,16 +210,36 @@ func (u *availableUpdates) NeedsUpdate(original *configv1.ClusterVersion) *confi
 	if u.UpdateService != string(original.Spec.Upstream) || u.Channel != original.Spec.Channel {
 		return nil
 	}
-	if equality.Semantic.DeepEqual(u.Updates, original.Status.AvailableUpdates) &&
-		equality.Semantic.DeepEqual(u.ConditionalUpdates, original.Status.ConditionalUpdates) &&
+
+	var updates []configv1.Release
+	var conditionalUpdates []configv1.ConditionalUpdate
+
+	if statusReleaseArchitecture {
+		updates = u.Updates
+		conditionalUpdates = u.ConditionalUpdates
+	} else {
+		for _, update := range u.Updates {
+			c := update.DeepCopy()
+			c.Architecture = configv1.ClusterVersionArchitecture("")
+			updates = append(updates, *c)
+		}
+		for _, conditionalUpdate := range u.ConditionalUpdates {
+			c := conditionalUpdate.DeepCopy()
+			c.Release.Architecture = configv1.ClusterVersionArchitecture("")
+			conditionalUpdates = append(conditionalUpdates, *c)
+		}
+	}
+
+	if equality.Semantic.DeepEqual(updates, original.Status.AvailableUpdates) &&
+		equality.Semantic.DeepEqual(conditionalUpdates, original.Status.ConditionalUpdates) &&
 		equality.Semantic.DeepEqual(u.Condition, resourcemerge.FindOperatorStatusCondition(original.Status.Conditions, u.Condition.Type)) {
 		return nil
 	}
 
 	config := original.DeepCopy()
 	resourcemerge.SetOperatorStatusCondition(&config.Status.Conditions, u.Condition)
-	config.Status.AvailableUpdates = u.Updates
-	config.Status.ConditionalUpdates = u.ConditionalUpdates
+	config.Status.AvailableUpdates = updates
+	config.Status.ConditionalUpdates = conditionalUpdates
 	return config
 }
 
@@ -283,25 +318,18 @@ func (optr *Operator) getAvailableUpdates() *availableUpdates {
 	return u
 }
 
-// getArchitecture returns the currently determined cluster architecture.
-func (optr *Operator) getArchitecture() string {
-	optr.statusLock.Lock()
-	defer optr.statusLock.Unlock()
-	return optr.architecture
-}
-
-// SetArchitecture sets the cluster architecture.
-func (optr *Operator) SetArchitecture(architecture string) {
-	optr.statusLock.Lock()
-	defer optr.statusLock.Unlock()
-	optr.architecture = architecture
-}
-
 func (optr *Operator) getDesiredArchitecture(update *configv1.Update) string {
-	if update != nil {
+	if update != nil && len(update.Architecture) > 0 {
 		return string(update.Architecture)
 	}
-	return ""
+	return optr.getCurrentArchitecture()
+}
+
+func (optr *Operator) getCurrentArchitecture() string {
+	if optr.release.Architecture == configv1.ClusterVersionArchitectureMulti {
+		return string(configv1.ClusterVersionArchitectureMulti)
+	}
+	return runtime.GOARCH
 }
 
 func calculateAvailableUpdatesStatus(ctx context.Context, clusterID string, transport *http.Transport, userAgent, updateService, desiredArch,

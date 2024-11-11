@@ -16,12 +16,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/diff"
 	randutil "k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -30,6 +30,8 @@ import (
 
 	configv1 "github.com/openshift/api/config/v1"
 	clientset "github.com/openshift/client-go/config/clientset/versioned"
+
+	"github.com/openshift/cluster-version-operator/pkg/internal"
 
 	"github.com/openshift/cluster-version-operator/lib/resourcemerge"
 	"github.com/openshift/cluster-version-operator/pkg/cvo"
@@ -184,15 +186,22 @@ func TestIntegrationCVO_initializeAndUpgrade(t *testing.T) {
 	options.ReleaseImage = payloadImage1
 	options.PayloadOverride = filepath.Join(dir, "0.0.1")
 	options.leaderElection = getLeaderElectionConfig(ctx, cfg)
-	alwaysEnableCapabilities := []configv1.ClusterVersionCapability{
-		configv1.ClusterVersionCapabilityIngress,
+	options.AlwaysEnableCapabilities = []string{string(configv1.ClusterVersionCapabilityIngress)}
+	if err := options.ValidateAndComplete(); err != nil {
+		t.Fatalf("incorrectly initialized options: %v", err)
 	}
-	controllers, err := options.NewControllerContext(cb, alwaysEnableCapabilities)
+
+	clusterVersionConfigInformerFactory, configInformerFactory := options.prepareConfigInformerFactories(cb)
+	featureset, gates, err := options.processInitialFeatureGate(context.Background(), configInformerFactory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controllers, err := options.NewControllerContext(cb, featureset, gates, clusterVersionConfigInformerFactory, configInformerFactory)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	worker := cvo.NewSyncWorker(retriever, cvo.NewResourceBuilder(cfg, cfg, nil, nil), 5*time.Second, wait.Backoff{Steps: 3}, "", "", record.NewFakeRecorder(100), payload.DefaultClusterProfile, alwaysEnableCapabilities)
+	worker := cvo.NewSyncWorker(retriever, cvo.NewResourceBuilder(cfg, cfg, nil, nil), 5*time.Second, wait.Backoff{Steps: 3}, "", "", record.NewFakeRecorder(100), payload.DefaultClusterProfile, stringsToCapabilities(options.AlwaysEnableCapabilities))
 	controllers.CVO.SetSyncWorkerForTesting(worker)
 
 	lock, err := createResourceLock(cb, options.Namespace, options.Name)
@@ -234,7 +243,7 @@ func TestIntegrationCVO_initializeAndUpgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(cv.Status, lastCV.Status) {
-		t.Fatalf("unexpected: %s", diff.ObjectReflectDiff(lastCV.Status, cv.Status))
+		t.Fatalf("unexpected: %s", cmp.Diff(lastCV.Status, cv.Status))
 	}
 	verifyReleasePayload(ctx, t, kc, ns, "0.0.1", payloadImage1)
 }
@@ -318,15 +327,22 @@ func TestIntegrationCVO_gracefulStepDown(t *testing.T) {
 	options.ReleaseImage = payloadImage1
 	options.PayloadOverride = filepath.Join(dir, "0.0.1")
 	options.leaderElection = getLeaderElectionConfig(ctx, cfg)
-	alwaysEnableCapabilities := []configv1.ClusterVersionCapability{
-		configv1.ClusterVersionCapabilityIngress,
+	options.AlwaysEnableCapabilities = []string{string(configv1.ClusterVersionCapabilityIngress)}
+	if err := options.ValidateAndComplete(); err != nil {
+		t.Fatalf("incorrectly initialized options: %v", err)
 	}
-	controllers, err := options.NewControllerContext(cb, alwaysEnableCapabilities)
+
+	clusterVersionConfigInformerFactory, configInformerFactory := options.prepareConfigInformerFactories(cb)
+	featureset, gates, err := options.processInitialFeatureGate(context.Background(), configInformerFactory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controllers, err := options.NewControllerContext(cb, featureset, gates, clusterVersionConfigInformerFactory, configInformerFactory)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	worker := cvo.NewSyncWorker(retriever, cvo.NewResourceBuilder(cfg, cfg, nil, nil), 5*time.Second, wait.Backoff{Steps: 3}, "", "", record.NewFakeRecorder(100), payload.DefaultClusterProfile, alwaysEnableCapabilities)
+	worker := cvo.NewSyncWorker(retriever, cvo.NewResourceBuilder(cfg, cfg, nil, nil), 5*time.Second, wait.Backoff{Steps: 3}, "", "", record.NewFakeRecorder(100), payload.DefaultClusterProfile, stringsToCapabilities(options.AlwaysEnableCapabilities))
 	controllers.CVO.SetSyncWorkerForTesting(worker)
 
 	lock, err := createResourceLock(cb, options.Namespace, options.Name)
@@ -514,19 +530,23 @@ metadata:
 	options.ReleaseImage = payloadImage1
 	options.PayloadOverride = payloadDir
 	options.leaderElection = getLeaderElectionConfig(ctx, cfg)
-	alwaysEnableCapabilities := []configv1.ClusterVersionCapability{
-		configv1.ClusterVersionCapabilityIngress,
+	options.AlwaysEnableCapabilities = []string{string(configv1.ClusterVersionCapabilityIngress)}
+	if err := options.ValidateAndComplete(); err != nil {
+		t.Fatalf("incorrectly initialized options: %v", err)
 	}
-	controllers, err := options.NewControllerContext(cb, alwaysEnableCapabilities)
+
+	clusterVersionConfigInformerFactory, configInformerFactory := options.prepareConfigInformerFactories(cb)
+	featureset, gates, err := options.processInitialFeatureGate(context.Background(), configInformerFactory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controllers, err := options.NewControllerContext(cb, featureset, gates, clusterVersionConfigInformerFactory, configInformerFactory)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	worker := cvo.NewSyncWorker(retriever, cvo.NewResourceBuilder(cfg, cfg, nil, nil), 5*time.Second, wait.Backoff{Steps: 3}, "", "", record.NewFakeRecorder(100), payload.DefaultClusterProfile, alwaysEnableCapabilities)
+	worker := cvo.NewSyncWorker(retriever, cvo.NewResourceBuilder(cfg, cfg, nil, nil), 5*time.Second, wait.Backoff{Steps: 3}, "", "", record.NewFakeRecorder(100), payload.DefaultClusterProfile, stringsToCapabilities(options.AlwaysEnableCapabilities))
 	controllers.CVO.SetSyncWorkerForTesting(worker)
-
-	arch := runtime.GOARCH
-	controllers.CVO.SetArchitecture(arch)
 
 	lock, err := createResourceLock(cb, options.Namespace, options.Name)
 	if err != nil {
@@ -552,7 +572,7 @@ metadata:
 		t.Logf("latest version:\n%s", printCV(lastCV))
 		t.Fatal("no request received at upstream URL")
 	}
-	expectedQuery := fmt.Sprintf("arch=%s&channel=test-channel&id=%s&version=0.0.1", arch, id.String())
+	expectedQuery := fmt.Sprintf("arch=%s&channel=test-channel&id=%s&version=0.0.1", runtime.GOARCH, id.String())
 	expectedQueryValues, err := url.ParseQuery(expectedQuery)
 	if err != nil {
 		t.Fatalf("could not parse expected query: %v", err)
@@ -587,7 +607,7 @@ func waitForUpdateAvailable(ctx context.Context, t *testing.T, client clientset.
 		verifyClusterVersionHistory(t, cv)
 
 		if !allowIncrementalFailure {
-			if failing := resourcemerge.FindOperatorStatusCondition(cv.Status.Conditions, cvo.ClusterStatusFailing); failing != nil && failing.Status == configv1.ConditionTrue {
+			if failing := resourcemerge.FindOperatorStatusCondition(cv.Status.Conditions, internal.ClusterStatusFailing); failing != nil && failing.Status == configv1.ConditionTrue {
 				return false, fmt.Errorf("operator listed as failing (%s): %s", failing.Reason, failing.Message)
 			}
 		}
@@ -658,7 +678,7 @@ func waitForUpdateAvailable(ctx context.Context, t *testing.T, client clientset.
 			return false, nil
 		}
 
-		if failing := resourcemerge.FindOperatorStatusCondition(cv.Status.Conditions, cvo.ClusterStatusFailing); failing != nil && failing.Status == configv1.ConditionTrue {
+		if failing := resourcemerge.FindOperatorStatusCondition(cv.Status.Conditions, internal.ClusterStatusFailing); failing != nil && failing.Status == configv1.ConditionTrue {
 			return false, fmt.Errorf("operator listed as failing (%s): %s", failing.Reason, failing.Message)
 		}
 
@@ -704,7 +724,7 @@ func verifyClusterVersionHistory(t *testing.T, cv *configv1.ClusterVersion) {
 			t.Fatalf("Invalid history, entry %d had no completion time: %#v", i, history)
 		}
 		if history.Image == previous.Image && history.Version == previous.Version {
-			t.Fatalf("Invalid history, entry %d and %d have identical updates, should be one entry: %s", i-1, i, diff.ObjectReflectDiff(previous, &history))
+			t.Fatalf("Invalid history, entry %d and %d have identical updates, should be one entry: %s", i-1, i, cmp.Diff(previous, &history))
 		}
 	}
 }
@@ -732,7 +752,7 @@ func verifyClusterVersionStatus(t *testing.T, cv *configv1.ClusterVersion, expec
 		CompletionTime: actual.CompletionTime,
 	}
 	if !reflect.DeepEqual(expect, actual) {
-		t.Fatalf("unexpected history: %s", diff.ObjectReflectDiff(expect, actual))
+		t.Fatalf("unexpected history: %s", cmp.Diff(expect, actual))
 	}
 	if len(cv.Status.VersionHash) == 0 {
 		t.Fatalf("unexpected version hash: %#v", cv.Status.VersionHash)
