@@ -20,7 +20,7 @@ type client struct {
 }
 
 type executor interface {
-	Run(args ...string) ([]byte, error)
+	run(args ...string) ([]byte, error)
 }
 
 type ocExecutor struct {
@@ -32,7 +32,7 @@ type ocExecutor struct {
 	execute func(dir, command string, args ...string) ([]byte, error)
 }
 
-func (e *ocExecutor) Run(args ...string) ([]byte, error) {
+func (e *ocExecutor) run(args ...string) ([]byte, error) {
 	logger := e.logger.WithValues("cmd", e.oc, "args", strings.Join(args, " "))
 	b, err := e.execute("", e.oc, args...)
 	if err != nil {
@@ -70,12 +70,13 @@ func NewOCCli(logger logr.Logger) (api.OC, error) {
 	timeout := 30 * time.Second
 	timeoutStr := os.Getenv("OC_CLI_TIMEOUT")
 	if timeoutStr != "" {
+		logger.Info(fmt.Sprintf("will use the environment timeout variable to run command: %s", timeoutStr))
 		timeout, err = time.ParseDuration(timeoutStr)
 		if err != nil {
 			return nil, err
 		}
 	}
-
+	logger.Info(fmt.Sprintf("timeout is: %s", timeout))
 	executor, err := newOCExecutor(oc, timeout, logger)
 	if err != nil {
 		return nil, err
@@ -88,8 +89,17 @@ func NewOCCli(logger logr.Logger) (api.OC, error) {
 }
 
 func (c *client) AdmReleaseExtract(o api.ReleaseExtractOptions) error {
+	_, err := os.Stat(o.To)
+	if errors.Is(err, os.ErrNotExist) {
+		c.logger.Info(fmt.Sprintf("the output directory does not exist, will create it: %s", o.To))
+		if err = os.Mkdir(o.To, 0755); err != nil {
+			err = fmt.Errorf("failed to create directory: %v", err)
+			return err
+		}
+		c.logger.Info(fmt.Sprintf("the output directory has been created: %s", o.To))
+	}
 	args := []string{"adm", "release", "extract", fmt.Sprintf("--to=%s", o.To)}
-	_, err := c.executor.Run(args...)
+	_, err = c.executor.run(args...)
 	if err != nil {
 		return err
 	}
@@ -98,9 +108,13 @@ func (c *client) AdmReleaseExtract(o api.ReleaseExtractOptions) error {
 
 func (c *client) Version(o api.VersionOptions) (string, error) {
 	args := []string{"version", fmt.Sprintf("--client=%t", o.Client)}
-	output, err := c.executor.Run(args...)
+	output, err := c.executor.run(args...)
 	if err != nil {
 		return "", err
 	}
 	return string(output), nil
+}
+
+func (c *client) Run(args ...string) ([]byte, error) {
+	return c.executor.run(args...)
 }

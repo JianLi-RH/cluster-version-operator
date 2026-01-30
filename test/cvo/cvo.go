@@ -2,7 +2,13 @@ package cvo
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
 
+	yamlv3 "gopkg.in/yaml.v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -79,5 +85,80 @@ var _ = g.Describe(`[Jira:"Cluster Version Operator"] cluster-version-operator`,
 		cvoPod := podList.Items[0]
 		sccAnnotation := cvoPod.Annotations["openshift.io/scc"]
 		o.Expect(sccAnnotation).To(o.Equal("hostaccess"), "Expected the annotation 'openshift.io/scc annotation' on pod %s to have the value 'hostaccess', but got %s", cvoPod.Name, sccAnnotation)
+	})
+
+	g.It(`should not install resources annotated with release.openshift.io/delete=true`, g.Label("Conformance", "High", "42543"), func() {
+		// Initialize the ocapi.OC instance
+		g.By("Setup ocapi.OC")
+		err := os.Setenv("OC_CLI_TIMEOUT", "90s")
+		o.Expect(err).NotTo(o.HaveOccurred(), "Setup environment variable OC_CLI_TIMEOUT failed")
+		ocClient, err := oc.NewOC(logger)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(ocClient).NotTo(o.BeNil())
+		defer func() {
+			err = os.Unsetenv("OC_CLI_TIMEOUT")
+			o.Expect(err).NotTo(o.HaveOccurred(), "Unset environment variable OC_CLI_TIMEOUT failed")
+		}()
+
+		g.By("Extract manifests")
+		annotation := "release.openshift.io/delete"
+		manifestDir := ocapi.ReleaseExtractOptions{To: "/tmp/OTA-42543-manifest"}
+		logger.Info(fmt.Sprintf("Extract manifests to: %s", manifestDir.To))
+		defer func() { _ = os.RemoveAll(manifestDir.To) }()
+		err = ocClient.AdmReleaseExtract(manifestDir)
+		o.Expect(err).NotTo(o.HaveOccurred(), "extract manifests failed")
+
+		entries, err := os.ReadDir(manifestDir.To)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		g.By("Start to iterate all manifests")
+		var closeFilePass = true
+		for _, entry := range entries {
+			nameLower := strings.ToLower(entry.Name())
+			if strings.Contains(nameLower, "cleanup") {
+				logger.Info(fmt.Sprintf("Skipping file %s because it matches cleanup filter", entry.Name()))
+				continue
+			}
+			filePath := filepath.Join(manifestDir.To, entry.Name())
+			file, err := os.Open(filePath)
+			o.Expect(err).NotTo(o.HaveOccurred())
+			defer func() {
+				if !closeFilePass {
+					// Close the file again
+					if err = file.Close(); err != nil {
+						o.Expect(err).NotTo(o.HaveOccurred(), "close file failed")
+					}
+				}
+			}()
+			decoder := yamlv3.NewDecoder(file)
+			for {
+				var doc map[string]interface{}
+				if err := decoder.Decode(&doc); err != nil {
+					if err == io.EOF {
+						break
+					}
+					continue
+				}
+				meta, _ := doc["metadata"].(map[string]interface{})
+				ann, _ := meta["annotations"].(map[string]interface{})
+				if ann == nil || ann[annotation] != "true" {
+					continue
+				}
+				kind, _ := doc["kind"].(string)
+				name, _ := meta["name"].(string)
+				namespace, _ := meta["namespace"].(string)
+				args := []string{"get", kind, name}
+				if namespace != "" {
+					args = append(args, "-n", namespace)
+				}
+				_, err := ocClient.Run(args...)
+				o.Expect(err).To(o.HaveOccurred(), "The deleted manifest should not be installed, but actually installed")
+			}
+			// close each file
+			err = file.Close()
+			if err != nil {
+				closeFilePass = false
+				o.Expect(err).NotTo(o.HaveOccurred(), "close file failed")
+			}
+		}
 	})
 })

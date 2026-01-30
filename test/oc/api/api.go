@@ -11,4 +11,5 @@ type VersionOptions struct {
 type OC interface {
 	AdmReleaseExtract(o ReleaseExtractOptions) error
 	Version(o VersionOptions) (string, error)
+	Run(args ...string) ([]byte, error)
 }
